@@ -1,0 +1,7 @@
+/target
+/.idea
+!/assets/.gitkeep
+!/assets/logs/.gitkeep
+
+/assets
+/assets/logs

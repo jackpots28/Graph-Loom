@@ -1,0 +1,29 @@
+[package]
+name = "graphdb_note_app_rs"
+version = "0.1.0"
+edition = "2024"
+
+[build]
+incremental = true
+rustflags = ["-C", "codegen-units=16"]
+rustc-wrapper = "sccache"
+
+[dependencies]
+
+# GUI
+eframe = "0.33.3"
+egui = "0.33.3"
+
+# Utils
+env_logger = { version = "0.11.8", default-features = false }
+rand = "0.9.2"
+uuid = { version = "1", features = ["v7", "fast-rng", "serde"] }
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
+time = { version = "0.3", features = ["formatting", "macros"] }
+anyhow = "1"
+serde_json = "1"
+csv = "1"
+
+# Testing Utils
+fake = { version = "4", features = ["derive"] }
