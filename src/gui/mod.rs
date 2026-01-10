@@ -1,1 +1,1 @@
-pub mod egui_frontend;
+pub mod frontend;
