@@ -74,6 +74,7 @@ impl GraphDatabase {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_node_metadata(&mut self, id: NodeId, new_metadata: HashMap<Key, Value>) -> bool {
         if let Some(node) = self.nodes.get_mut(&id) {
             node.metadata = new_metadata;
@@ -109,6 +110,7 @@ impl GraphDatabase {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_relationship_metadata(&mut self, id: Uuid, new_metadata: HashMap<Key, Value>) -> bool {
         if let Some(rel) = self.relationships.get_mut(&id) {
             rel.metadata = new_metadata;
@@ -161,7 +163,9 @@ impl GraphDatabase {
 
     pub fn get_node(&self, id: NodeId) -> Option<&Node> { self.nodes.get(&id) }
     pub fn get_relationship(&self, id: Uuid) -> Option<&Relationship> { self.relationships.get(&id) }
+    #[allow(dead_code)]
     pub fn node_count(&self) -> usize { self.nodes.len() }
+    #[allow(dead_code)]
     pub fn relationship_count(&self) -> usize { self.relationships.len() }
 
     // Fetch helpers:
@@ -174,6 +178,7 @@ impl GraphDatabase {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn find_node_ids_by_metadata_key(&self, key: &str) -> Vec<NodeId> {
         self
             .nodes
@@ -182,6 +187,7 @@ impl GraphDatabase {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn find_node_ids_by_metadata_kv(&self, key: &str, value: &str) -> Vec<NodeId> {
         self
             .nodes
@@ -202,6 +208,7 @@ impl GraphDatabase {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn find_relationship_ids_by_metadata_key(&self, key: &str) -> Vec<Uuid> {
         self
             .relationships
@@ -210,6 +217,7 @@ impl GraphDatabase {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn find_relationship_ids_by_metadata_kv(&self, key: &str, value: &str) -> Vec<Uuid> {
         self
             .relationships

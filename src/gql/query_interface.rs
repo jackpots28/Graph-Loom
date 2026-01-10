@@ -12,6 +12,7 @@ use crate::graph_utils::graph::{GraphDatabase, NodeId};
 pub enum QueryResultRow {
     Node { id: NodeId, label: String, metadata: HashMap<String, String> },
     Relationship { id: Uuid, from: NodeId, to: NodeId, label: String, metadata: HashMap<String, String> },
+    #[allow(dead_code)]
     Info(String),
 }
 
@@ -48,15 +49,6 @@ fn log_query(query: &str, outcome: &Result<QueryOutcome>) {
         let _ = file.write_all(line.as_bytes());
     }
 }
-
-// A very small, pragmatic subset of Cypher-like commands:
-// CREATE NODE Label {k:"v", ...}
-// CREATE REL from=<uuid> to=<uuid> label=Label {k:"v", ...}
-// MATCH NODE Label {k:"v", ...}
-// MATCH REL Label {k:"v", ...}
-// DELETE NODE <uuid>
-// DELETE REL <uuid>
-// RETURN forms are implicit for MATCH; we return rows.
 
 pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome> {
     let trimmed = query.trim();
@@ -103,6 +95,23 @@ pub fn execute_and_log(db: &mut GraphDatabase, query: &str) -> Result<QueryOutco
     res
 }
 
+// Split on a top-level WHERE (case-insensitive). Returns (head, where_clause)
+fn split_where(rest: &str) -> (String, Option<String>) {
+    // naive approach: find " WHERE " (case-insensitive). Also support trailing where without spaces around
+    let upper = rest.to_uppercase();
+    if let Some(idx) = upper.find(" WHERE ") {
+        let head = rest[..idx].trim().to_string();
+        let tail = rest[idx + 7..].trim().to_string();
+        (head, if tail.is_empty() { None } else { Some(tail) })
+    } else if let Some(idx) = upper.find(" WHERE") {
+        let head = rest[..idx].trim().to_string();
+        let tail = rest[idx + 6..].trim().to_string();
+        (head, if tail.is_empty() { None } else { Some(tail) })
+    } else {
+        (rest.trim().to_string(), None)
+    }
+}
+
 fn parse_label_and_props(rest: &str) -> Result<(String, HashMap<String, String>)> {
     // Expect: Label {k:"v", a:"b"} or just Label
     let mut label = rest.trim().to_string();
@@ -117,6 +126,104 @@ fn parse_label_and_props(rest: &str) -> Result<(String, HashMap<String, String>)
     }
     if label.is_empty() { return Err(anyhow!("missing label")); }
     Ok((label, props))
+}
+
+#[derive(Debug, Clone)]
+enum WhereCond {
+    // Nodes and Relationships
+    IdEquals(Uuid),
+    LabelEquals(String),
+    HasKey(String),
+    MetaEq(String, String),
+    MetaNe(String, String),
+    // Relationships only
+    FromEquals(Uuid),
+    ToEquals(Uuid),
+}
+
+fn parse_where_conds(s: &str) -> Result<Vec<WhereCond>> {
+    // Conditions are separated by AND (case-insensitive)
+    let mut out = Vec::new();
+    // allow multi-line safety (we treat newlines/semicolons as plain text within this WHERE, since the parser splits statements earlier)
+    // Better: manually scan tokens separated by 'AND'
+    let mut start = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut conds: Vec<&str> = Vec::new();
+    while i < bytes.len() {
+        // try to match 'AND' case-insensitive with word boundaries
+        if i + 3 <= bytes.len() {
+            let sub = &s[i..i+3];
+            if sub.eq_ignore_ascii_case("AND") {
+                // word boundary: previous and next must be whitespace or punctuation
+                let prev_ok = i == 0 || s[..i].chars().last().map(|ch| ch.is_whitespace() || ch == ')' ).unwrap_or(true);
+                let next_ok = i + 3 >= s.len() || s[i+3..].chars().next().map(|ch| ch.is_whitespace() || ch == '(' ).unwrap_or(true);
+                if prev_ok && next_ok {
+                    conds.push(s[start..i].trim());
+                    i += 3;
+                    start = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    conds.push(s[start..].trim());
+
+    for c in conds.into_iter().filter(|c| !c.is_empty()) {
+        let cu = c.to_uppercase();
+        if cu.starts_with("HAS(") && c.ends_with(')') {
+            let inside = &c[4..c.len()-1];
+            let key = inside.trim().trim_matches('"').trim_matches('\'');
+            if key.is_empty() { return Err(anyhow!("WHERE has() requires a key")); }
+            out.push(WhereCond::HasKey(key.to_string()));
+            continue;
+        }
+        // inequality key!="v"
+        if let Some(pos) = c.find("!=") {
+            let key = c[..pos].trim();
+            let val = c[pos+2..].trim().trim_matches('"').trim_matches('\'');
+            if key.eq_ignore_ascii_case("id") || key.eq_ignore_ascii_case("label")
+                || key.eq_ignore_ascii_case("from") || key.eq_ignore_ascii_case("to") {
+                return Err(anyhow!("'!=' supported only for metadata keys"));
+            }
+            if key.is_empty() { return Err(anyhow!("missing key before !=")); }
+            out.push(WhereCond::MetaNe(key.to_string(), val.to_string()));
+            continue;
+        }
+        // equality key="v" or id=uuid or label=Label or from/to=uuid
+        if let Some(pos) = c.find('=') {
+            let key = c[..pos].trim();
+            let val_raw = c[pos+1..].trim();
+            if key.eq_ignore_ascii_case("id") {
+                let id = Uuid::parse_str(val_raw.trim_matches('"'))?;
+                out.push(WhereCond::IdEquals(id));
+                continue;
+            }
+            if key.eq_ignore_ascii_case("from") {
+                let id = Uuid::parse_str(val_raw.trim_matches('"'))?;
+                out.push(WhereCond::FromEquals(id));
+                continue;
+            }
+            if key.eq_ignore_ascii_case("to") {
+                let id = Uuid::parse_str(val_raw.trim_matches('"'))?;
+                out.push(WhereCond::ToEquals(id));
+                continue;
+            }
+            if key.eq_ignore_ascii_case("label") {
+                let v = val_raw.trim_matches('"').trim_matches('\'').to_string();
+                out.push(WhereCond::LabelEquals(v));
+                continue;
+            }
+            // metadata equality requires quoted value but we'll accept bare too
+            let v = val_raw.trim_matches('"').trim_matches('\'').to_string();
+            if key.is_empty() { return Err(anyhow!("missing key before =")); }
+            out.push(WhereCond::MetaEq(key.to_string(), v));
+            continue;
+        }
+        return Err(anyhow!("unrecognized WHERE condition: {}", c));
+    }
+    Ok(out)
 }
 
 fn parse_keyvals(s: &str) -> Result<HashMap<String, String>> {
@@ -176,12 +283,34 @@ fn exec_create_rel(db: &mut GraphDatabase, rest: &str) -> Result<(Vec<QueryResul
 }
 
 fn exec_match_node(db: &GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow>, usize, usize, bool)> {
-    let (label, props) = parse_label_and_props(rest)?;
+    // Support optional WHERE after the label/props
+    let (head, where_clause) = split_where(rest);
+    let (label, props) = parse_label_and_props(&head)?;
     let mut ids = db.find_node_ids_by_label(&label);
     // Filter by props
     if !props.is_empty() {
         ids.retain(|id| {
             db.get_node(*id).map(|n| props.iter().all(|(k, v)| n.metadata.get(k).map(|m| m == v).unwrap_or(false))).unwrap_or(false)
+        });
+    }
+    // Apply WHERE conditions, if any
+    let conds = if let Some(ws) = where_clause { parse_where_conds(&ws)? } else { Vec::new() };
+    if !conds.is_empty() {
+        ids.retain(|id| {
+            if let Some(n) = db.get_node(*id) {
+                for c in &conds {
+                    match c {
+                        WhereCond::IdEquals(u) => { if &n.id != u { return false; } }
+                        WhereCond::LabelEquals(l) => { if &n.label != l { return false; } }
+                        WhereCond::HasKey(k) => { if !n.metadata.contains_key(k) { return false; } }
+                        WhereCond::MetaEq(k, v) => { if n.metadata.get(k).map(|m| m == v).unwrap_or(false) == false { return false; } }
+                        WhereCond::MetaNe(k, v) => { if n.metadata.get(k).map(|m| m == v).unwrap_or(false) { return false; } }
+                        // Relationship-only filters are ignored for nodes
+                        WhereCond::FromEquals(_) | WhereCond::ToEquals(_) => { return false; }
+                    }
+                }
+                true
+            } else { false }
         });
     }
     let mut rows = Vec::with_capacity(ids.len());
@@ -194,11 +323,32 @@ fn exec_match_node(db: &GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow
 }
 
 fn exec_match_rel(db: &GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow>, usize, usize, bool)> {
-    let (label, props) = parse_label_and_props(rest)?;
+    // Support optional WHERE after the label/props
+    let (head, where_clause) = split_where(rest);
+    let (label, props) = parse_label_and_props(&head)?;
     let mut ids = db.find_relationship_ids_by_label(&label);
     if !props.is_empty() {
         ids.retain(|rid| {
             db.get_relationship(*rid).map(|r| props.iter().all(|(k, v)| r.metadata.get(k).map(|m| m == v).unwrap_or(false))).unwrap_or(false)
+        });
+    }
+    let conds = if let Some(ws) = where_clause { parse_where_conds(&ws)? } else { Vec::new() };
+    if !conds.is_empty() {
+        ids.retain(|rid| {
+            if let Some(r) = db.get_relationship(*rid) {
+                for c in &conds {
+                    match c {
+                        WhereCond::IdEquals(u) => { if &r.id != u { return false; } }
+                        WhereCond::LabelEquals(l) => { if &r.label != l { return false; } }
+                        WhereCond::HasKey(k) => { if !r.metadata.contains_key(k) { return false; } }
+                        WhereCond::MetaEq(k, v) => { if r.metadata.get(k).map(|m| m == v).unwrap_or(false) == false { return false; } }
+                        WhereCond::MetaNe(k, v) => { if r.metadata.get(k).map(|m| m == v).unwrap_or(false) { return false; } }
+                        WhereCond::FromEquals(u) => { if &r.from_node != u { return false; } }
+                        WhereCond::ToEquals(u) => { if &r.to_node != u { return false; } }
+                    }
+                }
+                true
+            } else { false }
         });
     }
     let mut rows = Vec::with_capacity(ids.len());

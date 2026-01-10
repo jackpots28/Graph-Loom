@@ -20,7 +20,7 @@ pub struct AppStateFile {
 }
 
 impl AppStateFile {
-    pub fn from_runtime(db: &GraphDatabase, node_positions: &HashMap<NodeId, eframe::egui::Pos2>, pan: eframe::egui::Vec2, zoom: f32) -> Self {
+    pub fn from_runtime(db: &GraphDatabase, node_positions: &HashMap<NodeId, egui::Pos2>, pan: egui::Vec2, zoom: f32) -> Self {
         let node_positions = node_positions
             .iter()
             .map(|(id, pos)| (*id, pos.x, pos.y))
@@ -33,13 +33,13 @@ impl AppStateFile {
         }
     }
 
-    pub fn to_runtime(self) -> (GraphDatabase, HashMap<NodeId, eframe::egui::Pos2>, eframe::egui::Vec2, f32) {
-        let positions: HashMap<NodeId, eframe::egui::Pos2> = self
+    pub fn to_runtime(self) -> (GraphDatabase, HashMap<NodeId, egui::Pos2>, egui::Vec2, f32) {
+        let positions: HashMap<NodeId, egui::Pos2> = self
             .node_positions
             .into_iter()
-            .map(|(id, x, y)| (id, eframe::egui::pos2(x, y)))
+            .map(|(id, x, y)| (id, egui::pos2(x, y)))
             .collect();
-        let pan = eframe::egui::vec2(self.pan.0, self.pan.1);
+        let pan = egui::vec2(self.pan.0, self.pan.1);
         (self.db, positions, pan, self.zoom)
     }
 }
