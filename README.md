@@ -185,4 +185,4 @@ Issues and PRs are welcome. Please run cargo fmt and cargo clippy before submitt
 ---
 
 ## License
-unspecified currently - potential to change
+[Apache 2.0](https://github.com/jackpots28/Graph-Loom/blob/main/LICENSE)
