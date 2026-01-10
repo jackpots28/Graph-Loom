@@ -7,6 +7,7 @@ use time::{macros::format_description, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::graph_utils::graph::{GraphDatabase, NodeId};
+use super::cypher_spec::execute_cypher;
 
 #[derive(Debug, Clone)]
 pub enum QueryResultRow {
@@ -63,7 +64,32 @@ pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome
         let stmt = stmt.trim();
         if stmt.is_empty() { continue; }
         let upper = stmt.to_uppercase();
-        let res = if upper.starts_with("CREATE NODE ") {
+        // First: legacy minimal Cypher-style handler for pairwise MATCH...MERGE in one statement
+        let res = if upper.starts_with("MATCH (") && upper.contains(" MERGE ") {
+            // Legacy minimal Cypher-style pairwise support (kept for compatibility)
+            exec_cypher_match_merge(db, stmt)
+        // If the statement appears to be OpenCypher, route to the Cypher engine.
+        // Detect by keywords and forms that are NOT the legacy custom commands.
+        } else if (
+            // MATCH with '(' indicates Cypher pattern (avoid legacy MATCH NODE/REL)
+            (upper.starts_with("MATCH ") && stmt[6..].trim_start().starts_with('(')) ||
+            // OPTIONAL MATCH with '(' only
+            (upper.starts_with("OPTIONAL MATCH ") && stmt[15..].trim_start().starts_with('(')) ||
+            // MERGE is Cypher-only
+            upper.starts_with("MERGE ") ||
+            // RETURN is Cypher-only
+            upper.starts_with("RETURN ") ||
+            // DELETE / DETACH DELETE are Cypher-only, but avoid legacy DELETE NODE/REL
+            (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL ")) ||
+            upper.starts_with("DETACH DELETE ") ||
+            // CREATE with '(' pattern (avoid legacy CREATE NODE/REL)
+            (upper.starts_with("CREATE ") && stmt[7..].trim_start().starts_with('('))
+        ) {
+            let rows = execute_cypher(db, stmt)?;
+            // conservatively mark mutated if statement starts with CREATE or MERGE
+            let mutated = upper.starts_with("CREATE ") || upper.starts_with("MERGE ") || (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL ")) || upper.starts_with("DETACH DELETE ");
+            Ok((rows, 0, 0, mutated))
+        } else if upper.starts_with("CREATE NODE ") {
             exec_create_node(db, &stmt[12..])
         } else if upper.starts_with("CREATE REL ") {
             exec_create_rel(db, &stmt[11..])
@@ -238,6 +264,171 @@ fn parse_keyvals(s: &str) -> Result<HashMap<String, String>> {
         map.insert(k.to_string(), v.to_string());
     }
     Ok(map)
+}
+
+// Minimal openCypher-style support for pattern-based pair matching and merge
+// Supports statements like:
+//   MATCH (a:Label), (b:Label) [WHERE id(a) < id(b) | id(a) <> id(b)] MERGE (a)-[:TYPE]->(b)
+// Limitations: single label per variable; WHERE only supports id(var) comparisons using <,>,<=,>=,=,<>
+fn exec_cypher_match_merge(db: &mut GraphDatabase, stmt: &str) -> Result<(Vec<QueryResultRow>, usize, usize, bool)> {
+    // Split into MATCH ... [WHERE ...] MERGE ...
+    let up = stmt.to_uppercase();
+    let match_pos = up.find("MATCH ").ok_or_else(|| anyhow!("invalid MATCH/MERGE statement"))?;
+    let merge_pos = up.rfind(" MERGE ").ok_or_else(|| anyhow!("MATCH ... MERGE ... required"))?;
+    if merge_pos <= match_pos { return Err(anyhow!("MERGE must come after MATCH")); }
+    let match_part = stmt[match_pos + 6..merge_pos].trim();
+    let merge_part = stmt[merge_pos + 7..].trim();
+
+    // Extract optional WHERE from match_part
+    let (patterns_part, where_opt) = split_where(match_part);
+    // Expect two node patterns separated by comma: (a:Label), (b:Label)
+    let mut pats = patterns_part.split(',').map(|s| s.trim());
+    let p1 = pats.next().ok_or_else(|| anyhow!("missing first pattern"))?;
+    let p2 = pats.next().ok_or_else(|| anyhow!("missing second pattern"))?;
+    if pats.next().is_some() { return Err(anyhow!("only two node patterns are supported")); }
+
+    fn parse_var_label(p: &str) -> Result<(String, String)> {
+        // form: (var:Label) or (var)
+        let p = p.trim();
+        if !p.starts_with('(') || !p.ends_with(')') { return Err(anyhow!("invalid node pattern: {}", p)); }
+        let inside = &p[1..p.len()-1];
+        let mut var = String::new();
+        let mut label = String::new();
+        if let Some(col) = inside.find(':') {
+            var = inside[..col].trim().to_string();
+            label = inside[col+1..].trim().to_string();
+        } else {
+            var = inside.trim().to_string();
+        }
+        if var.is_empty() { return Err(anyhow!("variable name required in node pattern")); }
+        Ok((var, label))
+    }
+
+    let (var_a, label_a) = parse_var_label(p1)?;
+    let (var_b, label_b) = parse_var_label(p2)?;
+    // For now require labels on both and allow same label or different
+    if label_a.is_empty() || label_b.is_empty() { return Err(anyhow!("labels required in MATCH node patterns")); }
+
+    // Collect candidate node sets by label
+    let mut ids_a = db.find_node_ids_by_label(&label_a);
+    let mut ids_b = db.find_node_ids_by_label(&label_b);
+
+    // WHERE: only id(var) comparator id(var)
+    enum CmpOp { Lt, Lte, Gt, Gte, Eq, Ne }
+    let mut cmp_filter: Option<(CmpOp, String, String)> = None; // (op, leftVar, rightVar)
+    if let Some(w) = where_opt {
+        // Normalize spaces and case a bit; expect pattern like: id(a) < id(b)
+        let wu = w.replace(" ", "");
+        // Identify operator by precedence
+        let (op, sym) = if let Some(i) = wu.find("<=") { (CmpOp::Lte, "<=") }
+            else if let Some(i) = wu.find(">=") { (CmpOp::Gte, ">=") }
+            else if let Some(i) = wu.find("<>") { (CmpOp::Ne, "<>") }
+            else if let Some(i) = wu.find('<') { (CmpOp::Lt, "<") }
+            else if let Some(i) = wu.find('>') { (CmpOp::Gt, ">") }
+            else if let Some(i) = wu.find('=') { (CmpOp::Eq, "=") }
+            else { return Err(anyhow!("unsupported WHERE comparator; use <,>,<=,>=,=,<>")); };
+        let parts: Vec<&str> = wu.split(sym).collect();
+        if parts.len() != 2 { return Err(anyhow!("malformed WHERE clause")); }
+        let parse_id_fn = |s: &str| -> Result<String> {
+            if !s.to_uppercase().starts_with("ID(") || !s.ends_with(')') { return Err(anyhow!("WHERE must use id(var)")); }
+            let v = s[3..s.len()-1].to_string();
+            if v.is_empty() { return Err(anyhow!("empty variable in id()")); }
+            Ok(v)
+        };
+        let left = parse_id_fn(parts[0])?;
+        let right = parse_id_fn(parts[1])?;
+        cmp_filter = Some((op, left, right));
+    }
+
+    // Helper to compare UUID order
+    let cmp = |a: &uuid::Uuid, b: &uuid::Uuid, op: &CmpOp| -> bool {
+        let au = a.as_u128();
+        let bu = b.as_u128();
+        match op {
+            CmpOp::Lt => au < bu,
+            CmpOp::Lte => au <= bu,
+            CmpOp::Gt => au > bu,
+            CmpOp::Gte => au >= bu,
+            CmpOp::Eq => au == bu,
+            CmpOp::Ne => au != bu,
+        }
+    };
+
+    // Parse MERGE pattern: (varA)-[:TYPE]->(varB)
+    let mp = merge_part.trim();
+    // very minimal parse
+    let m_up = mp.to_uppercase();
+    if !mp.starts_with('(') || !m_up.contains(")-[:") || !m_up.contains("]->(") || !mp.ends_with(')') {
+        return Err(anyhow!("unsupported MERGE pattern; expected (a)-[:TYPE]->(b)"));
+    }
+    // Extract left var
+    let left_end = mp.find(')').ok_or_else(|| anyhow!("bad MERGE left"))?;
+    let left_var = mp[1..left_end].trim().to_string();
+    // Extract type
+    let type_start = mp[left_end..].find("[:").ok_or_else(|| anyhow!("missing [:TYPE]"))? + left_end + 2;
+    let type_end = mp[type_start..].find(']').ok_or_else(|| anyhow!("missing ] in MERGE type"))? + type_start;
+    let rel_type = mp[type_start..type_end].trim().to_string();
+    // Extract right var after "]->("
+    let arrow = mp[type_end..].find("->(").ok_or_else(|| anyhow!("missing ->( in MERGE"))? + type_end;
+    let right_start = arrow + 3;
+    if !mp.ends_with(')') { return Err(anyhow!("missing closing ) for MERGE right var")); }
+    let right_var = mp[right_start..mp.len()-1].trim().to_string();
+
+    // Sanity check variables map
+    let map_var = |name: &str| -> Result<&str> {
+        if name == var_a { Ok("A") } else if name == var_b { Ok("B") } else { Err(anyhow!("MERGE references unknown variable: {}", name)) }
+    };
+    map_var(&left_var)?; map_var(&right_var)?; // validate
+
+    // Build all pairs according to WHERE comparator if present
+    let mut rows = Vec::new();
+    let mut rel_count = 0usize;
+    let mut created = false;
+
+    // Precompute existing relationships set for MERGE semantics: (from,to,label)
+    let mut exists = std::collections::HashSet::<(uuid::Uuid, uuid::Uuid, String)>::new();
+    for r in db.relationships.values() {
+        exists.insert((r.from_node, r.to_node, r.label.clone()));
+    }
+
+    for a_id in &ids_a {
+        for b_id in &ids_b {
+            // variable self equality allowed only if var names differ; but if it's the same label and same set, allow a!=b unless WHERE explicitly allows equals
+            if var_a == var_b && a_id == b_id { continue; }
+            if let Some((op, l, r)) = &cmp_filter {
+                let (lv, rv) = if &l[..] == var_a && &r[..] == var_b {
+                    (a_id, b_id)
+                } else if &l[..] == var_b && &r[..] == var_a {
+                    (b_id, a_id)
+                } else {
+                    // comparator references unknown variables
+                    return Err(anyhow!("WHERE references unknown variables"));
+                };
+                if !cmp(lv, rv, op) { continue; }
+            }
+            // Determine from/to based on MERGE order (left_var -> right_var)
+            let (from, to) = if left_var == var_a && right_var == var_b {
+                (*a_id, *b_id)
+            } else if left_var == var_b && right_var == var_a {
+                (*b_id, *a_id)
+            } else {
+                return Err(anyhow!("MERGE variable order does not match MATCH variables"));
+            };
+            let key = (from, to, rel_type.clone());
+            if !exists.contains(&key) {
+                if let Some(rid) = db.add_relationship(from, to, rel_type.clone(), HashMap::new()) {
+                    exists.insert(key);
+                    rel_count += 1;
+                    created = true;
+                    if let Some(r) = db.get_relationship(rid).cloned() {
+                        rows.push(QueryResultRow::Relationship { id: r.id, from: r.from_node, to: r.to_node, label: r.label, metadata: r.metadata });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((rows, 0, rel_count, created))
 }
 
 fn exec_create_node(db: &mut GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow>, usize, usize, bool)> {

@@ -1460,9 +1460,9 @@ impl eframe::App for GraphApp {
                 }
             }
 
-            // Smooth convergence using a simple spring-damper integration, with a 3s timeout.
+            // Smooth convergence using a simple spring-damper integration, with a 5s timeout.
             let active = match self.converge_start {
-                Some(t0) => t0.elapsed() < Duration::from_secs(3),
+                Some(t0) => t0.elapsed() < Duration::from_secs(5),
                 None => false,
             };
             if active {
