@@ -3,8 +3,17 @@ name = "graph_loom"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
 
+authors = ["Jack Sims jack.m.sims@protonmail.com"]
+license = "Apache-2.0"
+description = "Interactive Graph Structure Utility"
+readme = "README.md"
+homepage = "https://github.com/jackpots28/Graph-Loom"
+repository = "https://github.com/jackpots28/Graph-Loom"
+keywords = ["graph", "visualization", "gui", "egui", "cypher"]
+categories = ["gui", "visualization", "data-structures", "development-tools"]
+
+[dependencies]
 # GUI
 eframe = "0.33.3"
 egui = "0.33.3"
