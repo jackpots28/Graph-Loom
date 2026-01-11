@@ -4,13 +4,14 @@ mod persistence;
 mod gql;
 
 use graph_utils::graph::GraphDatabase;
-use gui::egui_frontend::GraphApp;
+use gui::frontend::GraphApp;
 use persistence::persist;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(
+        // Really need a different icon...
         include_bytes!("../assets/icon.jpg")
     ).expect("Failed to load icon");
     let loaded_state = persist::load_active().ok().flatten();
