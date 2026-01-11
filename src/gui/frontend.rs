@@ -155,8 +155,37 @@ pub struct GraphApp {
     query_export_is_json: bool,
     query_export_path: String,
     query_export_status: Option<String>,
+    // Query suggestions
+    query_suggest_visible: bool,
+    query_suggest_items: Vec<String>,
+    query_suggest_index: usize,
+    query_suggest_hover_index: Option<usize>,
     // Layout control
     re_cluster_pending: bool,
+    // Cluster convergence controls (helps separate large groups visually)
+    cluster_converge_enabled: bool,
+    cluster_converge_threshold: usize,
+    cluster_converge_strength: f32,
+    gravity_enabled: bool,
+    gravity_strength: f32,
+    // Center-of-mass (COM) local gravity settings
+    com_gravity_radius: f32,         // within this radius, prefer attraction to local COM
+    com_gravity_min_neighbors: usize, // minimum nearby nodes to switch from global to local COM
+    hub_repulsion_scale: f32,
+    // Level-of-detail (LOD) rendering controls
+    lod_enabled: bool,
+    lod_label_min_zoom: f32,
+    lod_hide_labels_node_threshold: usize,
+    // Edge label readability controls
+    edge_labels_enabled: bool,
+    edge_labels_only_on_hover: bool,
+    edge_label_min_zoom: f32,
+    edge_label_count_threshold: usize,
+    edge_label_bg_alpha: u8,
+    // Focus/hover state for dimming/highlighting
+    hover_node: Option<NodeId>,
+    // Transient zoom HUD (show current zoom briefly when scrolling)
+    zoom_hud_until: Option<Instant>,
 }
 
 impl GraphApp {
@@ -217,7 +246,29 @@ impl GraphApp {
             query_export_is_json: true,
             query_export_path: String::new(),
             query_export_status: None,
+            query_suggest_visible: false,
+            query_suggest_items: Vec::new(),
+            query_suggest_index: 0,
+            query_suggest_hover_index: None,
             re_cluster_pending: true,
+            cluster_converge_enabled: false, // deprecated in favor of gravity/repulsion aids
+            cluster_converge_threshold: 30,
+            cluster_converge_strength: 3.0,
+            gravity_enabled: false,
+            gravity_strength: 6.0,
+            com_gravity_radius: 150.0,
+            com_gravity_min_neighbors: 2,
+            hub_repulsion_scale: 1.0,
+            lod_enabled: true,
+            lod_label_min_zoom: 0.7,
+            lod_hide_labels_node_threshold: 200,
+            edge_labels_enabled: true,
+            edge_labels_only_on_hover: false,
+            edge_label_min_zoom: 0.8,
+            edge_label_count_threshold: 500,
+            edge_label_bg_alpha: 170,
+            hover_node: None,
+            zoom_hud_until: None,
         }
     }
 
@@ -435,6 +486,69 @@ impl GraphApp {
         out
     }
 
+    // Label-centric target layout: place one centroid per distinct node label around a ring,
+    // then distribute nodes of that label in a small local spiral around the centroid.
+    // Returns a target position per node id.
+    fn compute_label_layout(&self, rect: Rect) -> HashMap<NodeId, Pos2> {
+        use std::collections::HashMap as Map;
+        let mut by_label: Map<String, Vec<NodeId>> = Map::new();
+        for (id, n) in &self.db.nodes {
+            by_label.entry(n.label.clone()).or_default().push(*id);
+        }
+        let labels: Vec<String> = by_label.keys().cloned().collect();
+        let k = labels.len().max(1) as f32;
+        let center = rect.center();
+        let ring_r = 0.35 * rect.width().min(rect.height());
+        let mut centroid_for_label: Map<String, Pos2> = Map::new();
+        for (i, lab) in labels.iter().enumerate() {
+            let angle = (i as f32) * (std::f32::consts::TAU / k);
+            let cx = center.x + ring_r * angle.cos();
+            let cy = center.y + ring_r * angle.sin();
+            centroid_for_label.insert(lab.clone(), Pos2::new(cx, cy));
+        }
+        // Distribute per-label nodes around its centroid
+        let mut targets: Map<NodeId, Pos2> = Map::new();
+        for (lab, ids) in by_label {
+            if let Some(c) = centroid_for_label.get(&lab).copied() {
+                // local radius scaled by group size
+                let group_n = ids.len().max(1) as f32;
+                let local_radius = 30.0_f32 + 3.0 * group_n.sqrt();
+                for (j, nid) in ids.iter().enumerate() {
+                    let jj = j as f32;
+                    // golden angle spiral for even spread
+                    let ang = jj * 2.39996323; // ~137.5°
+                    let r = (jj + 1.0).sqrt() * (local_radius / group_n.sqrt().max(1.0));
+                    let p = Pos2::new(c.x + r * ang.cos(), c.y + r * ang.sin());
+                    targets.insert(*nid, p);
+                }
+            }
+        }
+        targets
+    }
+
+    // Stable color per label, chosen from a small distinct palette via hashing.
+    fn color_for_label(label: &str) -> Color32 {
+        const PALETTE: [Color32; 12] = [
+            Color32::from_rgb(0x7b, 0xa3, 0xff), // blue
+            Color32::from_rgb(0xff, 0xa3, 0x7b), // orange
+            Color32::from_rgb(0x7b, 0xff, 0xa3), // green
+            Color32::from_rgb(0xff, 0x7b, 0xa3), // pink
+            Color32::from_rgb(0xa3, 0x7b, 0xff), // violet
+            Color32::from_rgb(0xff, 0xe0, 0x7b), // yellow
+            Color32::from_rgb(0x7b, 0xff, 0xe0), // teal
+            Color32::from_rgb(0xe0, 0x7b, 0xff), // purple
+            Color32::from_rgb(0x7b, 0xe0, 0xff), // cyan
+            Color32::from_rgb(0xff, 0x7b, 0xe0), // magenta
+            Color32::from_rgb(0x9a, 0xcd, 0x32), // yellowgreen
+            Color32::from_rgb(0xcd, 0x32, 0x9a), // fuchsia
+        ];
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        label.hash(&mut hasher);
+        let h = hasher.finish() as usize;
+        PALETTE[h % PALETTE.len()]
+    }
+
     // Post-process to ensure nodes are not overlapping. Operates in world space.
     // Uses a simple spatial hash grid and a few iterations of repulsive separation.
     fn resolve_overlaps(&mut self, rect: Rect) {
@@ -571,7 +685,29 @@ impl GraphApp {
             query_export_is_json: true,
             query_export_path: String::new(),
             query_export_status: None,
+            query_suggest_visible: false,
+            query_suggest_items: Vec::new(),
+            query_suggest_index: 0,
+            query_suggest_hover_index: None,
             re_cluster_pending: true,
+            cluster_converge_enabled: false,
+            cluster_converge_threshold: 30,
+            cluster_converge_strength: 3.0,
+            gravity_enabled: false,
+            gravity_strength: 6.0,
+            com_gravity_radius: 150.0,
+            com_gravity_min_neighbors: 2,
+            hub_repulsion_scale: 1.0,
+            lod_enabled: true,
+            lod_label_min_zoom: 0.7,
+            lod_hide_labels_node_threshold: 200,
+            edge_labels_enabled: true,
+            edge_labels_only_on_hover: false,
+            edge_label_min_zoom: 0.8,
+            edge_label_count_threshold: 500,
+            edge_label_bg_alpha: 170,
+            hover_node: None,
+            zoom_hud_until: None,
         }
     }
 
@@ -611,6 +747,35 @@ impl GraphApp {
             }
             Err(e) => self.save_error = Some(format!("Save version failed: {}", e)),
         }
+    }
+
+    /// Clear all selections and related transient UI state
+    fn deselect_all(&mut self) {
+        self.selected = None;
+        self.dragging = None;
+        self.hover_node = None;
+        self.multi_selected_nodes.clear();
+        self.query_selected_nodes.clear();
+        self.query_selected_rels.clear();
+        self.pick_target = None;
+        self.create_rel_from = None;
+        self.create_rel_to = None;
+        self.pending_new_node_for_link = None;
+        self.mark_dirty();
+    }
+
+    // Get a node position if present; otherwise, initialize a reasonable default
+    // position (golden spiral around canvas center) and return it. This prevents
+    // panics when newly created nodes have not yet been laid out by ensure_layout.
+    fn get_or_init_position(&mut self, id: NodeId, rect: Rect) -> Pos2 {
+        if let Some(p) = self.node_positions.get(&id) {
+            return *p;
+        }
+        let center = rect.center();
+        let k = self.node_positions.len() as u32;
+        let pos = golden_spiral_position(center, k, rect);
+        self.node_positions.insert(id, pos);
+        pos
     }
 }
 
@@ -691,24 +856,39 @@ impl eframe::App for GraphApp {
                     }
                     ui.separator();
                     ui.label("Zoom");
-                    ui.add(egui::Slider::new(&mut self.zoom, 0.25..=2.0));
+                    ui.add(egui::Slider::new(&mut self.zoom, 0.25..=2.0).clamping(egui::SliderClamping::Always));
                 });
 
                 ui.menu_button("Sidebar", |ui| {
                     let toggle = if self.sidebar_open { "Hide Sidebar" } else { "Show Sidebar" };
-                    if ui.button(toggle).clicked() { self.sidebar_open = !self.sidebar_open; }
+                    if ui.button(toggle).clicked() {
+                        // If hiding the sidebar, end bulk-select mode
+                        if self.sidebar_open {
+                            self.multi_select_active = false;
+                        }
+                        self.sidebar_open = !self.sidebar_open;
+                    }
                     ui.separator();
                     ui.label("Mode");
-                    if ui.selectable_label(self.sidebar_mode == SidebarMode::Tooling, "Tooling").clicked() { self.sidebar_mode = SidebarMode::Tooling; }
-                    if ui.selectable_label(self.sidebar_mode == SidebarMode::Query, "Query").clicked() { self.sidebar_mode = SidebarMode::Query; }
+                    if ui.selectable_label(self.sidebar_mode == SidebarMode::Tooling, "Tooling").clicked() {
+                        self.sidebar_mode = SidebarMode::Tooling;
+                    }
+                    if ui.selectable_label(self.sidebar_mode == SidebarMode::Query, "Query").clicked() {
+                        // Switching away from tooling: disable bulk select if active
+                        self.multi_select_active = false;
+                        self.sidebar_mode = SidebarMode::Query;
+                    }
                 });
 
-                ui.menu_button("Windows", |ui| {
+                ui.menu_button("Window", |ui| {
                     ui.label(format!(
                         "Open pop-outs: nodes {} | rels {}",
                         self.open_node_windows.len(),
                         self.open_rel_windows.len()
                     ));
+                    if ui.button("Deselect All").clicked() {
+                        self.deselect_all();
+                    }
                     if ui.button("Close All Pop-outs").clicked() {
                         self.open_node_windows.clear();
                         self.open_rel_windows.clear();
@@ -744,6 +924,66 @@ impl eframe::App for GraphApp {
                             }
                         }
                         ui.small("Clusters by relationships, labels, and metadata. Dense clusters toward border; sparse toward center.");
+
+                        ui.separator();
+                        ui.label("Layout aids for large graphs");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.gravity_enabled, "Enable gravity to center");
+                            ui.add(egui::Slider::new(&mut self.gravity_strength, 0.5..=20.0)
+                                .logarithmic(true)
+                                .clamping(egui::SliderClamping::Always)
+                                .text("gravity"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Local COM radius");
+                            ui.add(egui::Slider::new(&mut self.com_gravity_radius, 60.0..=800.0)
+                                .logarithmic(true)
+                                .clamping(egui::SliderClamping::Always)
+                                .suffix(" px"))
+                                .on_hover_text("Within this radius, nodes are attracted to the center of mass of nearby nodes instead of the window center");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Min neighbors for COM");
+                            let mut min_n = self.com_gravity_min_neighbors as i32;
+                            if ui.add(egui::Slider::new(&mut min_n, 1..=10).clamping(egui::SliderClamping::Always)).changed() {
+                                self.com_gravity_min_neighbors = min_n as usize;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Hub repulsion scale");
+                            ui.add(egui::Slider::new(&mut self.hub_repulsion_scale, 0.0..=3.0)
+                                .clamping(egui::SliderClamping::Always)
+                                .text("hubs spread"));
+                        });
+                        ui.separator();
+                        ui.label("Level of detail (LOD)");
+                        ui.checkbox(&mut self.lod_enabled, "Enable LOD").on_hover_text("Hide most labels when zoomed out or when the graph is very large; always show for hovered/selected/query-matched nodes");
+                        ui.horizontal(|ui| {
+                            ui.label("Hide labels when nodes ≥");
+                            ui.add(egui::DragValue::new(&mut self.lod_hide_labels_node_threshold).range(50..=2000));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Min zoom for labels");
+                            ui.add(egui::Slider::new(&mut self.lod_label_min_zoom, 0.3..=1.5).clamping(egui::SliderClamping::Always));
+                        });
+
+                        ui.separator();
+                        ui.label("Relationship label readability");
+                        ui.horizontal(|ui| {
+                            ui.label("Min zoom for edge labels");
+                            ui.add(egui::Slider::new(&mut self.edge_label_min_zoom, 0.3..=2.0).clamping(egui::SliderClamping::Always));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Hide when edges ≥");
+                            ui.add(egui::DragValue::new(&mut self.edge_label_count_threshold).range(100..=5000));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Label background opacity");
+                            let mut alpha_f: f32 = self.edge_label_bg_alpha as f32;
+                            if ui.add(egui::Slider::new(&mut alpha_f, 30.0..=255.0)).changed() {
+                                self.edge_label_bg_alpha = alpha_f as u8;
+                            }
+                        });
                         });
 
                     egui::CollapsingHeader::new("Create Node")
@@ -951,7 +1191,7 @@ impl eframe::App for GraphApp {
                             if let Some(e) = error_rel { ui.colored_label(Color32::RED, e); }
                         });
 
-                    egui::CollapsingHeader::new("Bulk Edit Nodes")
+                    let bulk_resp = egui::CollapsingHeader::new("Bulk Edit Nodes")
                         .default_open(false)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -1012,6 +1252,10 @@ impl eframe::App for GraphApp {
                             }
                             if let Some(msg) = &self.bulk_status { ui.small(msg.clone()); }
                         });
+                    // If the Bulk Edit section is collapsed, automatically stop selecting mode
+                    if !bulk_resp.fully_open() && self.multi_select_active {
+                        self.multi_select_active = false;
+                    }
                     });
                 });
         }
@@ -1041,8 +1285,278 @@ impl eframe::App for GraphApp {
                             let edit = egui::TextEdit::multiline(&mut self.query_text)
                                 .desired_rows(8)
                                 .lock_focus(true)
-                                .desired_width(f32::INFINITY);
-                            ui.add(edit);
+                                .desired_width(f32::INFINITY)
+                                // Assign a persistent id so we can programmatically move the caret
+                                .id_source("query_text_edit");
+                            let te_resp = ui.add(edit);
+
+                            // Suggestion logic: compute prefix token at end-of-text
+                            // Global early cancel: ESC should always close the suggestions popup
+                            // regardless of current focus nuances. Consume the key so egui doesn't
+                            // also clear focus in a way that reopens or interferes with our state.
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.query_suggest_visible {
+                                self.query_suggest_visible = false;
+                                self.query_suggest_hover_index = None;
+                                ui.input_mut(|i| {
+                                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                                });
+                            }
+
+                            let want_popup_all = ui.input(|i| {
+                                let pressed = i.key_pressed(egui::Key::Space);
+                                let mod_ok = if cfg!(target_os = "macos") { i.modifiers.command } else { i.modifiers.ctrl };
+                                pressed && mod_ok
+                            });
+
+                            // Detect acceptance keys early to avoid recomputing suggestions before using selection
+                            let accept_enter_early = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt);
+                            let accept_tab_early = ui.input(|i| i.key_pressed(egui::Key::Tab));
+
+                            let mut consider_recompute = (te_resp.changed() && !(accept_enter_early || accept_tab_early)) || want_popup_all;
+                            // Only show suggestions when the text edit has focus
+                            if !te_resp.has_focus() { self.query_suggest_visible = false; }
+
+                            if consider_recompute && te_resp.has_focus() {
+                                // Try to preserve the currently selected item across recomputes
+                                let prev_selected_idx = self.query_suggest_hover_index.unwrap_or(self.query_suggest_index);
+                                let prev_selected_item = self
+                                    .query_suggest_items
+                                    .get(prev_selected_idx)
+                                    .cloned();
+                                // Determine the active token prefix (only if cursor at end or assume end)
+                                let text = self.query_text.as_str();
+                                // New rule: if the character immediately before the cursor is a space,
+                                // do not supply suggestions unless explicitly forced with Cmd/Ctrl+Space.
+                                // We assume caret at end (common case for console typing).
+                                let last_char_is_space = text.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+                                if last_char_is_space && !want_popup_all {
+                                    // Hide suggestions and skip recompute
+                                    self.query_suggest_visible = false;
+                                    self.query_suggest_items.clear();
+                                    self.query_suggest_hover_index = None;
+                                    // Do not proceed with computing prefix/pool in this frame
+                                } else {
+                                let caret_at_end = true; // simplified: egui API for exact caret is elaborate; assume common case
+                                let (prefix, start_idx) = if caret_at_end {
+                                    // Trim trailing whitespace (e.g., Enter inserted a newline) before detecting token
+                                    let mut end = text.len();
+                                    while end > 0 {
+                                        let c = text.as_bytes()[end - 1] as char;
+                                        if c.is_whitespace() { end -= 1; } else { break; }
+                                    }
+                                    // Walk back to find token start: letters, digits, underscore, colon, dot
+                                    let bytes = text.as_bytes();
+                                    let mut i = end;
+                                    while i > 0 {
+                                        let c = bytes[i-1] as char;
+                                        if c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '.' { i -= 1; } else { break; }
+                                    }
+                                    (text[i..end].to_string(), i)
+                                } else { (String::new(), text.len()) };
+
+                                // Build suggestion universe
+                                let mut pool: Vec<String> = Vec::new();
+                                const KEYWORDS: &[&str] = &[
+                                    "MATCH","OPTIONAL","OPTIONAL MATCH","WHERE","RETURN","ORDER BY","SKIP","LIMIT",
+                                    "CREATE","MERGE","SET","REMOVE","DELETE","DETACH DELETE",
+                                    "DISTINCT","ASC","DESC",
+                                ];
+                                pool.extend(KEYWORDS.iter().map(|s| s.to_string()));
+                                // Dynamic: node labels, relationship types, common property keys
+                                use std::collections::BTreeSet;
+                                let mut labels: BTreeSet<String> = BTreeSet::new();
+                                let mut rels: BTreeSet<String> = BTreeSet::new();
+                                let mut props: BTreeSet<String> = BTreeSet::new();
+                                for n in self.db.nodes.values() {
+                                    if !n.label.is_empty() { labels.insert(n.label.clone()); }
+                                    for k in n.metadata.keys() { props.insert(k.clone()); }
+                                }
+                                for r in self.db.relationships.values() {
+                                    if !r.label.is_empty() { rels.insert(r.label.clone()); }
+                                    for k in r.metadata.keys() { props.insert(k.clone()); }
+                                }
+                                pool.extend(labels.into_iter().map(|l| format!(":{}", l))); // label suggestions
+                                // relationship types as :TYPE
+                                pool.extend(rels.into_iter().map(|t| format!(":{}", t)));
+                                pool.extend(props.into_iter().map(|p| format!("{}.{}", "n", p))); // simple property access example
+
+                                // Filter by prefix (case-insensitive)
+                                let pfx_up = prefix.to_uppercase();
+                                // Only show suggestions if there is a non-empty prefix,
+                                // unless the user explicitly requested with Cmd/Ctrl+Space
+                                let mut items: Vec<String> = if want_popup_all {
+                                    pool
+                                } else if !prefix.is_empty() {
+                                    pool.into_iter().filter(|s| s.to_uppercase().starts_with(&pfx_up)).collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                items.sort();
+                                items.dedup();
+                                if !items.is_empty() {
+                                    self.query_suggest_items = items.into_iter().take(30).collect();
+                                    self.query_suggest_visible = true;
+                                    // Preserve previous selection when possible; otherwise clamp to 0
+                                    if let Some(prev_item) = prev_selected_item {
+                                        if let Some(pos) = self.query_suggest_items.iter().position(|s| s == &prev_item) {
+                                            self.query_suggest_index = pos;
+                                        } else {
+                                            self.query_suggest_index = 0;
+                                        }
+                                    } else {
+                                        self.query_suggest_index = 0;
+                                    }
+                                    self.query_suggest_hover_index = None;
+                                } else {
+                                    self.query_suggest_visible = false;
+                                }
+                                // Note: start_idx currently unused in this simplified approach
+                                }
+                            }
+
+                            // Handle navigation/acceptance keys for suggestions
+                            if self.query_suggest_visible && te_resp.has_focus() {
+                                let mut move_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                                let mut move_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                                // Reuse early-detected acceptance to ensure consistent behavior
+                                let accept_enter = accept_enter_early;
+                                let accept_tab = accept_tab_early;
+                                let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                if cancel { self.query_suggest_visible = false; }
+                                if move_up && !self.query_suggest_items.is_empty() {
+                                    if self.query_suggest_index == 0 { self.query_suggest_index = self.query_suggest_items.len()-1; } else { self.query_suggest_index -= 1; }
+                                    // keyboard navigation takes precedence; clear hover
+                                    self.query_suggest_hover_index = None;
+                                }
+                                if move_down && !self.query_suggest_items.is_empty() {
+                                    self.query_suggest_index = (self.query_suggest_index + 1) % self.query_suggest_items.len();
+                                    self.query_suggest_hover_index = None;
+                                }
+                                if (accept_enter || accept_tab) && !self.query_suggest_items.is_empty() {
+                                    let chosen_idx = self.query_suggest_hover_index.unwrap_or(self.query_suggest_index);
+                                    let chosen = self.query_suggest_items[chosen_idx].clone();
+                                    // Replace last token with chosen
+                                    let text = self.query_text.clone();
+                                    let mut end = text.len();
+                                    // Skip trailing whitespace (e.g., newline inserted by Enter) to find the real token end
+                                    while end > 0 {
+                                        let c = text.as_bytes()[end - 1] as char;
+                                        if c.is_whitespace() { end -= 1; } else { break; }
+                                    }
+                                    let bytes = text.as_bytes();
+                                    let mut i = end;
+                                    while i > 0 {
+                                        let c = bytes[i-1] as char;
+                                        if c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '.' { i -= 1; } else { break; }
+                                    }
+                                    // If there is no token (i == end), do not accept; allow Enter to insert newline
+                                    if i == end { 
+                                        // Hide suggestions on acceptance attempt without token
+                                        self.query_suggest_visible = false; 
+                                        self.query_suggest_hover_index = None; 
+                                        // Do not modify text here; TextEdit will handle newline for Enter
+                                        // and Tab will do nothing visible
+                                        
+                                    } else {
+                                        let mut new_text = String::from(&text[..i]);
+                                        // Tab-complete style: do not insert a leading space; replace token in-place
+                                        new_text.push_str(&chosen);
+                                        // For Enter acceptance, add a trailing space for convenience; Tab adds none
+                                        if accept_enter { new_text.push(' '); }
+                                        self.query_text = new_text;
+                                        self.query_suggest_visible = false;
+                                        self.query_suggest_hover_index = None;
+                                        // Consume the Enter/Tab key so TextEdit doesn't also handle it (which could move the caret)
+                                        ui.input_mut(|i| {
+                                            if accept_enter {
+                                                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                                            }
+                                            if accept_tab {
+                                                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+                                            }
+                                        });
+                                        // Explicitly move caret to the end of the inserted suggestion (before any trailing space)
+                                        // Compute char index at insertion start + chosen length
+                                        let insertion_start_chars = text[..i].chars().count();
+                                        let chosen_len_chars = chosen.chars().count();
+                                        let target_char_index = insertion_start_chars + chosen_len_chars; // before the added space
+                                        let id = egui::Id::new("query_text_edit");
+                                        if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
+                                            let cursor = egui::text::CCursor::new(target_char_index);
+                                            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+                                            state.store(ui.ctx(), id);
+                                        }
+                                        // Do not force focus change here; requesting focus on a widget
+                                        // that egui doesn't consider alive in this frame can cause a panic.
+                                        // The editor typically retains focus after keyboard acceptance.
+                                    }
+                                }
+                            }
+
+                            // Render suggestions list under the editor
+                            if self.query_suggest_visible && !self.query_suggest_items.is_empty() {
+                                ui.add_space(4.0);
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                                        // reset hover before drawing
+                                        self.query_suggest_hover_index = None;
+                                        for (idx, it) in self.query_suggest_items.clone().into_iter().enumerate() {
+                                            let is_selected = match self.query_suggest_hover_index {
+                                                Some(h) => idx == h,
+                                                None => idx == self.query_suggest_index,
+                                            };
+                                            let resp = ui.selectable_label(is_selected, it.clone());
+                                            if resp.hovered() {
+                                                self.query_suggest_hover_index = Some(idx);
+                                            }
+                                            if resp.clicked() {
+                                                self.query_suggest_index = idx;
+                                                // mimic acceptance
+                                                let chosen = self.query_suggest_items[idx].clone();
+                                                let text = self.query_text.clone();
+                                                let mut end = text.len();
+                                                // Skip trailing whitespace to find token end
+                                                while end > 0 {
+                                                    let c = text.as_bytes()[end - 1] as char;
+                                                    if c.is_whitespace() { end -= 1; } else { break; }
+                                                }
+                                                let bytes = text.as_bytes();
+                                                let mut i = end;
+                                                while i > 0 {
+                                                    let c = bytes[i-1] as char;
+                                                    if c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '.' { i -= 1; } else { break; }
+                                                }
+                                                if i != end {
+                                                    let mut new_text = String::from(&text[..i]);
+                                                    // Mouse accept: replace token in-place, then add trailing space (common UX)
+                                                    new_text.push_str(&chosen);
+                                                    new_text.push(' ');
+                                                    self.query_text = new_text;
+                                                    self.query_suggest_visible = false;
+                                                    self.query_suggest_hover_index = None;
+                                                    // Explicitly move caret to the end of the inserted suggestion (before the trailing space)
+                                                    let insertion_start_chars = text[..i].chars().count();
+                                                    let chosen_len_chars = chosen.chars().count();
+                                                    let target_char_index = insertion_start_chars + chosen_len_chars;
+                                                    let id = egui::Id::new("query_text_edit");
+                                                    if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
+                                                        let cursor = egui::text::CCursor::new(target_char_index);
+                                                        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+                                                        state.store(ui.ctx(), id);
+                                                    }
+                                                    // Avoid forcing focus to prevent potential egui panic when the
+                                                    // focused id is not in the node list for the current frame.
+                                                } else {
+                                                    // No token: just close suggestions
+                                                    self.query_suggest_visible = false;
+                                                    self.query_suggest_hover_index = None;
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+                            }
                             let mut run_now = false;
                             if ui.button("Run").clicked() {
                                 run_now = true;
@@ -1143,7 +1657,13 @@ impl eframe::App for GraphApp {
                                 ui.monospace(line);
                             }
                             ui.separator();
-                            ui.label("History:");
+                            ui.horizontal(|ui| {
+                                ui.label("History:");
+                                let can_clear = !self.query_history.is_empty();
+                                if ui.add_enabled(can_clear, egui::Button::new("Clear History")).on_hover_text("Remove all saved queries from this session").clicked() {
+                                    self.query_history.clear();
+                                }
+                            });
                             for (idx, h) in self.query_history.iter().enumerate().rev().take(20) {
                                 if ui.small_button(format!("{}: {}", idx+1, h)).clicked() {
                                     self.query_text = h.clone();
@@ -1228,10 +1748,33 @@ impl eframe::App for GraphApp {
                 if scroll != 0.0 {
                     let factor = (1.0 + scroll * 0.001).clamp(0.9, 1.1);
                     self.zoom = (self.zoom * factor).clamp(0.25, 2.0);
+                    // Show transient zoom HUD
+                    self.zoom_hud_until = Some(Instant::now() + Duration::from_millis(1000));
+                    ui.ctx().request_repaint_after(Duration::from_millis(16));
                 }
             }
 
             let painter = ui.painter_at(available);
+
+            // Draw transient zoom HUD if active
+            if let Some(until) = self.zoom_hud_until {
+                let now = Instant::now();
+                if now < until {
+                    let text = format!("{:.2}x", self.zoom);
+                    let font = egui::FontId::proportional(14.0);
+                    let galley = ui.painter().layout_no_wrap(text, font, Color32::WHITE);
+                    let pad = Vec2::new(8.0, 4.0);
+                    let size = galley.size() + pad * 2.0;
+                    let pos = Pos2::new(available.center().x - size.x * 0.5, available.top() + 12.0);
+                    let rect = Rect::from_min_size(pos, size);
+                    let bg = Color32::from_rgba_premultiplied(20, 20, 20, 200);
+                    painter.rect_filled(rect, 8.0, bg);
+                    painter.galley(pos + pad, galley, Color32::WHITE);
+                    ui.ctx().request_repaint_after(Duration::from_millis(16));
+                } else {
+                    self.zoom_hud_until = None;
+                }
+            }
 
             // Helper to transform world->screen using captured pan/zoom to avoid borrowing self
             let center = available.center();
@@ -1251,8 +1794,30 @@ impl eframe::App for GraphApp {
                 )
             };
 
-            // Draw edges
-            let edge_stroke = Stroke { width: 1.5, color: Color32::LIGHT_GRAY };
+            // Determine hover before drawing for highlighting/dimming
+            // Compute hover over nearest node within radius in screen space
+            let mut hover_node: Option<NodeId> = None;
+            if let Some(mouse_pos) = ui.ctx().pointer_hover_pos() {
+                let node_radius = 10.0 * self.zoom;
+                let mut best_d2 = f32::INFINITY;
+                for (id, _node) in &self.db.nodes {
+                    if let Some(pw) = self.node_positions.get(id) {
+                        let ps = to_screen(*pw);
+                        let dx = ps.x - mouse_pos.x; let dy = ps.y - mouse_pos.y;
+                        let d2 = dx*dx + dy*dy;
+                        if d2 <= (node_radius*node_radius) && d2 < best_d2 {
+                            best_d2 = d2; hover_node = Some(*id);
+                        }
+                    }
+                }
+            }
+            self.hover_node = hover_node;
+
+            // Draw edges (with slight curvature and adaptive opacity)
+            let edge_count = self.db.relationships.len();
+            let base_alpha: u8 = if self.zoom < 0.7 || edge_count > 600 { 120 } else if self.zoom < 0.9 || edge_count > 300 { 160 } else { 200 };
+            let base_color = Color32::from_rgba_premultiplied(200, 200, 200, base_alpha);
+            let edge_stroke = Stroke { width: 1.5, color: base_color };
             for rel in self.db.relationships.values() {
                 if let (Some(pa), Some(pb)) = (
                     self.node_positions.get(&rel.from_node),
@@ -1260,37 +1825,89 @@ impl eframe::App for GraphApp {
                 ) {
                     let a = to_screen(*pa);
                     let b = to_screen(*pb);
+                    let incident_hover = self.hover_node.map(|h| h == rel.from_node || h == rel.to_node).unwrap_or(false);
                     // Highlight if selected AND the popout for this relationship is open
                     let is_sel = matches!(self.selected, Some(SelectedItem::Rel(id)) if id == rel.id)
                         && self.open_rel_windows.contains(&rel.id);
                     let is_qsel = self.query_selected_rels.contains(&rel.id);
-                    let stroke = if is_sel {
+                    let mut stroke = if is_sel {
                         Stroke { width: 3.0, color: Color32::from_rgb(255, 200, 80) }
-                    } else if is_qsel {
+                    } else if is_qsel || incident_hover {
                         Stroke { width: 2.5, color: Color32::from_rgb(120, 220, 255) }
                     } else {
                         edge_stroke
                     };
-                    painter.line_segment([a, b], stroke);
+                    // Dim edges when hovering another node
+                    if self.hover_node.is_some() && !incident_hover && !is_sel && !is_qsel {
+                        let c = stroke.color; stroke.color = Color32::from_rgba_premultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * 0.4) as u8);
+                    }
 
-                    // Relationship label at midpoint with a small perpendicular offset
+                    // Curvature: offset midpoint along perpendicular; stable by hashing endpoints
+                    let dir = Vec2::new(b.x - a.x, b.y - a.y);
+                    let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
+                    if len > 1.0 {
+                        let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                        let n = Vec2::new(-dir.y / len, dir.x / len);
+                        let mut seed = rel.from_node.as_u128() ^ rel.to_node.as_u128();
+                        // cheap hash to decide side and magnitude
+                        seed ^= seed >> 33;
+                        let sign = if (seed & 1) == 0 { 1.0 } else { -1.0 };
+                        let mag = (8.0 * self.zoom).clamp(2.0, 16.0);
+                        let ctrl = mid + n * (mag * sign as f32);
+                        // approximate quadratic curve with two segments: a->ctrl and ctrl->b
+                        painter.line_segment([a, ctrl], stroke);
+                        painter.line_segment([ctrl, b], stroke);
+                    } else {
+                        painter.line_segment([a, b], stroke);
+                    }
+
+                    // Relationship label at midpoint with improved LOD visibility and pill background
                     let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
                     let dir = Vec2::new(b.x - a.x, b.y - a.y);
                     let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
-                    let mut offset = Vec2::ZERO;
-                    if len > f32::EPSILON {
-                        // Perpendicular to the edge, scaled by zoom to keep readable
+
+                    // Visibility: only show relationship label text when hovering over a connected node
+                    let show_label = incident_hover;
+
+                    if show_label && len > f32::EPSILON {
+                        // Perpendicular and tangential offsets, alternating per edge for separation
                         let n = Vec2::new(-dir.y / len, dir.x / len);
-                        offset = n * (8.0f32 * self.zoom);
+                        let t = Vec2::new(dir.x / len, dir.y / len);
+                        let mut seed = rel.from_node.as_u128() ^ (rel.to_node.as_u128().rotate_left(17)) ^ rel.id.as_u128();
+                        seed ^= seed >> 33;
+                        let side = if (seed & 1) == 0 { 1.0 } else { -1.0 };
+                        let lane = ((seed >> 1) & 3) as i32 - 1; // -1,0,1,2 → center-ish shift
+                        let perp_mag = (8.0 * self.zoom).clamp(4.0, 16.0);
+                        let tan_mag = (lane as f32) * 4.0 * self.zoom;
+                        let offset = n * (perp_mag * side as f32) + t * tan_mag;
+
+                        // Text styling
+                        let font = egui::FontId::proportional((12.0 * self.zoom).clamp(8.0, 16.0));
+                        let txt_color = if is_sel { Color32::from_rgb(30, 30, 30) } else { Color32::from_rgb(20, 20, 20) };
+                        let pill_fill = if is_sel {
+                            Color32::from_rgba_premultiplied(255, 220, 120, 220)
+                        } else if is_qsel || incident_hover {
+                            Color32::from_rgba_premultiplied(180, 235, 255, self.edge_label_bg_alpha)
+                        } else {
+                            Color32::from_rgba_premultiplied(245, 245, 245, self.edge_label_bg_alpha)
+                        };
+                        let outline = Color32::from_rgba_premultiplied(0, 0, 0, 120);
+
+                        // Layout the text to size the pill
+                        let galley = ui.painter().layout_no_wrap(rel.label.clone(), font.clone(), txt_color);
+                        let pad = Vec2::new(6.0 * self.zoom, 3.0 * self.zoom);
+                        let pill_size = galley.size() + pad * 2.0;
+                        let center = mid + offset;
+                        let rect = Rect::from_center_size(center, pill_size);
+                        // Halo: draw a slightly larger translucent rect behind
+                        let halo_rect = Rect::from_center_size(center, pill_size + Vec2::new(4.0, 2.0));
+                        let rounding = 6.0 * self.zoom;
+                        painter.rect_filled(halo_rect, rounding, Color32::from_rgba_premultiplied(0, 0, 0, 25));
+                        // Pill background (optionally could add outline if API supports it)
+                        painter.rect_filled(rect, rounding, pill_fill);
+                        // Draw text centered
+                        painter.galley(center - galley.size() * 0.5, galley, txt_color);
                     }
-                    let rel_text_color = if is_sel { Color32::from_rgb(255, 230, 120) } else if is_qsel { Color32::from_rgb(180, 235, 255) } else { Color32::WHITE };
-                    painter.text(
-                        mid + offset,
-                        egui::Align2::CENTER_CENTER,
-                        rel.label.as_str(),
-                        egui::FontId::proportional(12.0),
-                        rel_text_color,
-                    );
                 }
             }
 
@@ -1301,8 +1918,14 @@ impl eframe::App for GraphApp {
             // Track drag state transition to restart convergence timer
             let was_dragging = self.dragging.is_some();
 
-            for (id, _node) in &self.db.nodes {
-                let pos_world = self.node_positions[id];
+            // Iterate over a snapshot of ids to avoid borrowing conflicts when we
+            // lazily initialize positions.
+            let node_ids: Vec<NodeId> = self.db.nodes.keys().copied().collect();
+            for id in node_ids {
+                // Be resilient if a node is missing a precomputed position
+                let pos_world = self.get_or_init_position(id, available);
+                // Safe to immutably read the node after the mutable borrow in get_or_init_position ends
+                let node = match self.db.nodes.get(&id) { Some(n) => n, None => continue };
                 let pos_screen = to_screen(pos_world);
                 let rect = Rect::from_center_size(pos_screen, Vec2::splat(node_radius * 2.0));
                 let resp = ui.allocate_rect(rect, Sense::click_and_drag());
@@ -1312,29 +1935,54 @@ impl eframe::App for GraphApp {
                     if self.dragging.is_none() {
                         // Drag start
                         self.converge_start = Some(Instant::now());
-                        self.dragging = Some(*id);
+                        self.dragging = Some(id);
                     }
                     any_node_dragged = true;
                 }
 
                 if resp.clicked() {
-                    clicked_node = Some(*id);
+                    clicked_node = Some(id);
                 }
+
+                // Hover tooltip: show readable details without cluttering the canvas
+                resp.on_hover_ui(|ui| {
+                    ui.label(egui::RichText::new(
+                        format_short_node(&self.db, id)
+                    ).strong());
+                    ui.monospace(format!("UUID: {}", id));
+                    // Show degree (incident edges) and up to 5 properties
+                    let degree = self
+                        .db
+                        .relationships
+                        .values()
+                        .filter(|r| r.from_node == id || r.to_node == id)
+                        .count();
+                    ui.small(format!("degree: {}", degree));
+                    if let Some(n) = self.db.nodes.get(&id) {
+                        let mut shown = 0usize;
+                        for (k, v) in n.metadata.iter() {
+                            if shown >= 5 { break; }
+                            ui.small(format!("{}: {}", k, v));
+                            shown += 1;
+                        }
+                        if n.metadata.len() > 5 { ui.small(format!("(+{} more)", n.metadata.len() - 5)); }
+                    }
+                });
 
                 // Visuals
                 // A node is visually selected only if its details window is open
-                let is_selected = matches!(self.selected, Some(SelectedItem::Node(nid)) if nid == *id)
-                    && self.open_node_windows.contains(id);
+                let is_selected = matches!(self.selected, Some(SelectedItem::Node(nid)) if nid == id)
+                    && self.open_node_windows.contains(&id);
                 let fill = if is_selected { Color32::from_rgb(80, 120, 255) } else { Color32::from_rgb(60, 60, 60) };
                 // Highlight From/To selections
                 let mut stroke = if is_selected { Stroke::new(2.0, Color32::WHITE) } else { Stroke::new(1.5, Color32::DARK_GRAY) };
-                if self.create_rel_from == Some(*id) { stroke = Stroke::new(2.5, Color32::from_rgb(80, 220, 120)); }
-                if self.create_rel_to == Some(*id) { stroke = Stroke::new(2.5, Color32::from_rgb(255, 170, 60)); }
+                if self.create_rel_from == Some(id) { stroke = Stroke::new(2.5, Color32::from_rgb(80, 220, 120)); }
+                if self.create_rel_to == Some(id) { stroke = Stroke::new(2.5, Color32::from_rgb(255, 170, 60)); }
                 painter.circle_filled(pos_screen, node_radius, fill);
                 painter.circle_stroke(pos_screen, node_radius, stroke);
 
                 // Bulk select halo indicator (independent from popout selection)
-                if self.multi_selected_nodes.contains(id) {
+                if self.multi_selected_nodes.contains(&id) {
                     let halo_r = node_radius + (3.0 * self.zoom).clamp(2.0, 8.0);
                     painter.circle_stroke(
                         pos_screen,
@@ -1343,18 +1991,45 @@ impl eframe::App for GraphApp {
                     );
                 }
 
-                // Label (append short uuid)
-                let text = format_short_node(&self.db, *id);
-                painter.text(
-                    pos_screen + Vec2::new(0.0, -node_radius - 4.0),
-                    egui::Align2::CENTER_BOTTOM,
-                    text,
-                    egui::FontId::proportional(14.0),
-                    Color32::WHITE,
-                );
+                // Label (no UUID) with label-based color coding and LOD rules
+                let show_label = if !self.lod_enabled { true } else {
+                    let many = self.db.nodes.len() >= self.lod_hide_labels_node_threshold;
+                    let zoom_ok = self.zoom >= self.lod_label_min_zoom;
+                    let is_hover = self.hover_node == Some(id);
+                    let is_query = self.query_selected_nodes.contains(&id);
+                    let is_sel = matches!(self.selected, Some(SelectedItem::Node(nid)) if nid == id);
+                    (!many && zoom_ok) || is_hover || is_query || is_sel
+                };
+                if show_label {
+                    let text = format_short_node(&self.db, id);
+                    let label_color = GraphApp::color_for_label(&node.label);
+                    let pos_text = pos_screen + Vec2::new(0.0, -node_radius - 4.0);
+                    // multi-direction halo for readability
+                    painter.text(
+                        pos_text + Vec2::new(0.0, 1.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        &text,
+                        egui::FontId::proportional((14.0 * self.zoom).clamp(10.0, 22.0)),
+                        Color32::BLACK,
+                    );
+                    painter.text(
+                        pos_text + Vec2::new(1.0, 0.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        &text,
+                        egui::FontId::proportional((14.0 * self.zoom).clamp(10.0, 22.0)),
+                        Color32::BLACK,
+                    );
+                    painter.text(
+                        pos_text,
+                        egui::Align2::CENTER_BOTTOM,
+                        text,
+                        egui::FontId::proportional((14.0 * self.zoom).clamp(10.0, 22.0)),
+                        label_color,
+                    );
+                }
 
                 // Query-match halo indicator
-                if self.query_selected_nodes.contains(id) {
+                if self.query_selected_nodes.contains(&id) {
                     let halo_r = node_radius + (5.0 * self.zoom).clamp(2.0, 10.0);
                     painter.circle_stroke(
                         pos_screen,
@@ -1424,9 +2099,28 @@ impl eframe::App for GraphApp {
             // Edge hit testing and selection when background is clicked and not dragging nodes
             if !self.multi_select_active && clicked_node.is_none() && !any_node_dragged && bg_resp.clicked() {
                 if let Some(pointer_pos) = ui.input(|i| i.pointer.latest_pos()) {
-                    // Find nearest edge under cursor
+                    // Helper: compute the same curved polyline used for drawing
+                    let compute_edge_points = |a: Pos2, b: Pos2, rel_id: Uuid, from_id: NodeId, to_id: NodeId| -> (Pos2, Pos2, Pos2) {
+                        let dir = Vec2::new(b.x - a.x, b.y - a.y);
+                        let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
+                        if len > 1.0 {
+                            let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                            let n = Vec2::new(-dir.y / len, dir.x / len);
+                            let mut seed = from_id.as_u128() ^ to_id.as_u128();
+                            seed ^= seed >> 33;
+                            let sign = if (seed & 1) == 0 { 1.0 } else { -1.0 };
+                            let mag = (8.0 * self.zoom).clamp(2.0, 16.0);
+                            let ctrl = mid + n * (mag * sign as f32);
+                            (a, ctrl, b)
+                        } else {
+                            // very short edge: treat as straight
+                            (a, a.lerp(b, 0.5), b)
+                        }
+                    };
+
+                    // Find nearest edge under cursor against the two drawn segments (a->ctrl, ctrl->b)
                     let mut best: Option<(Uuid, f32)> = None; // (rel_id, distance)
-                    let threshold = 6.0_f32; // pixels
+                    let tolerance_px = 8.0_f32; // selection slop in screen pixels
                     for rel in self.db.relationships.values() {
                         if let (Some(pa), Some(pb)) = (
                             self.node_positions.get(&rel.from_node),
@@ -1434,8 +2128,19 @@ impl eframe::App for GraphApp {
                         ) {
                             let a = to_screen(*pa);
                             let b = to_screen(*pb);
-                            let d = point_segment_distance(pointer_pos, a, b);
-                            if d <= threshold {
+                            // Quick AABB reject expanded by tolerance
+                            let minx = a.x.min(b.x) - tolerance_px;
+                            let maxx = a.x.max(b.x) + tolerance_px;
+                            let miny = a.y.min(b.y) - tolerance_px;
+                            let maxy = a.y.max(b.y) + tolerance_px;
+                            if pointer_pos.x < minx || pointer_pos.x > maxx || pointer_pos.y < miny || pointer_pos.y > maxy {
+                                // still continue because curved ctrl could extend beyond, but this is a good early out.
+                            }
+                            let (pa_s, pc_s, pb_s) = compute_edge_points(a, b, rel.id, rel.from_node, rel.to_node);
+                            let d1 = point_segment_distance(pointer_pos, pa_s, pc_s);
+                            let d2 = point_segment_distance(pointer_pos, pc_s, pb_s);
+                            let d = d1.min(d2);
+                            if d <= tolerance_px {
                                 match best {
                                     None => best = Some((rel.id, d)),
                                     Some((_, bd)) if d < bd => best = Some((rel.id, d)),
@@ -1460,11 +2165,9 @@ impl eframe::App for GraphApp {
                 }
             }
 
-            // Smooth convergence using a simple spring-damper integration, with a 5s timeout.
-            let active = match self.converge_start {
-                Some(t0) => t0.elapsed() < Duration::from_secs(5),
-                None => false,
-            };
+            // Smooth convergence using a simple spring-damper integration.
+            // Neo4j-style aids for large graphs: center gravity and degree-aware repulsion.
+            let active = match self.converge_start { Some(t0) => t0.elapsed() < Duration::from_secs(5), None => false };
             if active {
                 // Nodes connected by relationships experience a spring force toward a target length.
                 // Nearby nodes experience a soft repulsive force to maintain spacing.
@@ -1506,7 +2209,44 @@ impl eframe::App for GraphApp {
                     }
                 }
 
-                // Repulsive separation for close pairs (O(N^2) but small graphs are fine)
+                // Gravity: prefer local center-of-mass (COM) attraction when nodes cluster off-center; otherwise pull to window center.
+                if self.gravity_enabled {
+                    let center_world = from_screen(available.center());
+                    let k_g = self.gravity_strength;
+                    let r2 = self.com_gravity_radius * self.com_gravity_radius;
+                    // Iterate over a snapshot to avoid borrow conflicts
+                    let snapshot: Vec<(NodeId, Pos2)> = self.node_positions.iter().map(|(k,v)| (*k, *v)).collect();
+                    for (id, pos) in snapshot.iter() {
+                        // Compute local COM of neighbors within radius (excluding self)
+                        let mut sum_x = 0.0f32;
+                        let mut sum_y = 0.0f32;
+                        let mut count = 0usize;
+                        for (oid, opos) in snapshot.iter() {
+                            if oid == id { continue; }
+                            let dx = opos.x - pos.x;
+                            let dy = opos.y - pos.y;
+                            if dx*dx + dy*dy <= r2 {
+                                sum_x += opos.x;
+                                sum_y += opos.y;
+                                count += 1;
+                            }
+                        }
+                        let target = if count >= self.com_gravity_min_neighbors {
+                            Pos2 { x: sum_x / (count as f32), y: sum_y / (count as f32) }
+                        } else {
+                            center_world
+                        };
+                        let dir = Vec2::new(target.x - pos.x, target.y - pos.y);
+                        *forces.entry(*id).or_insert(Vec2::ZERO) += dir * k_g;
+                    }
+                }
+
+                // Degree-aware repulsive separation for close pairs (O(N^2) but small/med graphs are fine)
+                let mut deg: HashMap<NodeId, usize> = HashMap::new();
+                for rel in self.db.relationships.values() {
+                    *deg.entry(rel.from_node).or_insert(0) += 1;
+                    *deg.entry(rel.to_node).or_insert(0) += 1;
+                }
                 let ids: Vec<NodeId> = self.db.nodes.keys().copied().collect();
                 for i in 0..ids.len() {
                     for j in (i + 1)..ids.len() {
@@ -1522,10 +2262,15 @@ impl eframe::App for GraphApp {
                         if dist < min_sep {
                             let dir = Vec2::new(dx / dist, dy / dist);
                             let overlap = (min_sep - dist).max(0.0);
+                            // Scale by node degrees to spread hubs a bit more
+                            let da = *deg.get(&a).unwrap_or(&0) as f32;
+                            let db = *deg.get(&b).unwrap_or(&0) as f32;
+                            let scale_a = 1.0 + self.hub_repulsion_scale * (da + 1.0).ln();
+                            let scale_b = 1.0 + self.hub_repulsion_scale * (db + 1.0).ln();
                             let f = dir * (repulse_k * overlap);
                             // push opposite directions
-                            *forces.entry(a).or_insert(Vec2::ZERO) -= f;
-                            *forces.entry(b).or_insert(Vec2::ZERO) += f;
+                            *forces.entry(a).or_insert(Vec2::ZERO) -= f * scale_a;
+                            *forces.entry(b).or_insert(Vec2::ZERO) += f * scale_b;
                         }
                     }
                 }
@@ -1904,11 +2649,36 @@ fn short_uuid(id: Uuid) -> String {
 }
 
 fn format_short_node(db: &GraphDatabase, id: NodeId) -> String {
+    // Render-friendly node caption without UUID to improve readability on canvas.
+    // Prefer a human-friendly metadata field if present.
     if let Some(n) = db.nodes.get(&id) {
-        format!("{} ({})", n.label, short_uuid(id))
-    } else {
-        format!("<unknown> ({})", short_uuid(id))
+        // Prefer commonly used human-readable keys
+        if let Some(name) = n.metadata.get("name").filter(|s| !s.is_empty()) {
+            return name.clone();
+        }
+        if let Some(title) = n.metadata.get("title").filter(|s| !s.is_empty()) {
+            return title.clone();
+        }
+        if let Some(keyword) = n.metadata.get("keyword").filter(|s| !s.is_empty()) {
+            return keyword.clone();
+        }
+        // Requirement: Use one of the values from a node's metadata as the rendered name
+        // If no preferred key exists but metadata has entries, use a deterministic choice:
+        // pick the first non-empty value by alphabetical key order.
+        if !n.metadata.is_empty() {
+            let mut keys: Vec<&String> = n.metadata.keys().collect();
+            keys.sort();
+            for k in keys {
+                if let Some(val) = n.metadata.get(k).filter(|s| !s.is_empty()) {
+                    return val.clone();
+                }
+            }
+        }
+        // Fallback to label only (no short uuid)
+        return n.label.clone();
     }
+    // Unknown node fallback
+    "<unknown>".to_string()
 }
 
 // Golden-angle spiral placement around the provided center.
