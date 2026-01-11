@@ -3,7 +3,6 @@ name = "graph_loom"
 version = "0.1.0"
 edition = "2024"
 
-
 authors = ["Jack Sims jack.m.sims@protonmail.com"]
 license = "Apache-2.0"
 description = "Interactive Graph Structure Utility"

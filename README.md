@@ -2,7 +2,9 @@
 
 ## Overview
 
-Graph-Loom is a lightweight, local-first graph notebook and visualizer built with Rust + egui. It lets you create nodes and relationships, view them on a canvas, and interactively arrange them with a smooth, physics-assisted layout. A minimal GQL-like query console supports creating, matching, and deleting graph elements.
+Graph-Loom is a lightweight, local-first graph notebook and visualizer built with Rust + egui. It lets you create nodes and relationships, view them on a canvas, and interactively arrange them with a smooth, physics-assisted layout. A pragmatic OpenCypher-like query console supports creating, matching, and deleting graph elements (with parameters, ORDER BY, SKIP/LIMIT, and more).
+
+![Tooling menus](assets/graph_loom_tooling_dropdowns_snippet.png)
 
 ---
 
@@ -11,6 +13,15 @@ Graph-Loom is a lightweight, local-first graph notebook and visualizer built wit
 - Auto-cluster layout
   - Community detection clusters nodes by: relationships, label similarity, and metadata overlap.
   - Well-formed clusters are placed toward the border; sparsely connected/outlier nodes gravitate toward the center for readability.
+
+- Large-graph visual aids (Neo4j-style)
+  - Gravity-to-center and degree-aware repulsion to keep components cohesive while spreading hubs.
+  - Level-of-detail (LOD) rendering for hundreds of nodes: adaptive edge opacity, label hiding when zoomed out or in very large graphs, and dynamic font scaling.
+  - Hover/selection emphasis: highlight incident edges/nodes and dim non-neighbors for quick local context.
+  - Slightly curved edges to separate overlapping/parallel links; relationship labels offset from edges for clarity.
+  - Configurable in Sidebar → Layout (LOD toggle, thresholds, and zoom cutoff).
+
+  ![Node hover details](assets/graph_loom_node_hover_snippet.png)
 
 - No-overlap guarantee
   - A fast post-layout resolver separates nodes to a minimum spacing so they never render on top of each other.
@@ -34,6 +45,8 @@ Graph-Loom is a lightweight, local-first graph notebook and visualizer built wit
 
 - Query logging
   - Executed queries are logged to assets/logs/queries_YYYYMMDD.log with basic status info.
+
+  ![Cypher MATCH example](assets/graph_loom_cypher_match_snippet.png)
 
 ---
 
@@ -72,6 +85,8 @@ On first launch, if assets/state.ron is missing, you’ll start with an empty gr
   - Sidebar → Layout → Auto-cluster layout re-runs the community layout on all nodes.
   - Drag nodes directly; neighbors will adjust smoothly. Motion stops after 3s unless you drag again or re-layout.
 
+  ![Tooling and layout controls](assets/graph_loom_tooling_dropdowns_snippet.png)
+
 - Bulk edit
   - Sidebar → Bulk Edit Nodes for batch label/metadata operations, where available.
 
@@ -88,9 +103,29 @@ On first launch, if assets/state.ron is missing, you’ll start with an empty gr
 
 ### GQL Tooling (Built-in Query Console)
 
-This app ships a small, pragmatic subset of Cypher-like commands. Multiple statements can be separated by semicolons. Queries are logged automatically.
+This app ships a pragmatic subset of OpenCypher. Multiple statements can be separated by semicolons. Queries are logged automatically.
 
-Supported commands:
+Autocomplete is available in the Query Console. Start typing to see suggestions or press Cmd/Ctrl+Space to force suggestions. Use Up/Down to navigate; Tab completes inline without a trailing space; Enter inserts the suggestion and appends a space; Esc closes the popup. The caret is placed at the end of the inserted token.
+
+![Autocomplete in query console](assets/graph_loom_cypher_query_autocomplete_snippet.png)
+
+Supported commands (OpenCypher subset):
+
+- MATCH/OPTIONAL MATCH patterns:
+  - MATCH (n:Label {k:"v"}) RETURN n
+  - MATCH (a:Label)-[r:TYPE]->(b:Other) RETURN a, r, b
+  - Variable-length relationships: MATCH (a)-[r:TYPE*1..3]->(b) RETURN r
+- WHERE filters (common cases):
+  - Property compares: n.prop = "v", n.prop <> "v", <, <=, >, >= (numeric when possible)
+  - String operators: CONTAINS, STARTS WITH, ENDS WITH
+  - id() comparisons in simple forms (e.g., id(a) < id(b))
+- RETURN/ORDER BY/SKIP/LIMIT with DISTINCT
+- CREATE and MERGE of nodes and relationships (single-hop)
+- DELETE and DETACH DELETE
+- SET/REMOVE (basic forms)
+- Parameters using $param in patterns and WHERE clauses via the parameterized execution path
+
+Legacy convenience commands are also supported for quick operations:
 
 - CREATE NODE Label {k:"v", ...}
 - CREATE REL from=<uuid> to=<uuid> label=Label {k:"v", ...}
@@ -99,12 +134,21 @@ Supported commands:
 - DELETE NODE <uuid>
 - DELETE REL <uuid>
 
+Additionally, a minimal openCypher-style MATCH…MERGE statement is supported to operate on node pairs by label:
+
+- MATCH (a:Label), (b:Label) [WHERE id(a) < id(b) | id(a) <> id(b) | id(a) <= id(b) | id(a) >= id(b) | id(a) = id(b)] MERGE (a)-[:TYPE]->(b)
+
+Notes for the Cypher-style form
+- Both node patterns must specify a single label (no property maps or multi-label yet).
+- WHERE supports only id(var) comparisons using <, <=, >, >=, =, <>. Use id(a) < id(b) to generate each unordered pair once (avoids duplicates).
+- MERGE semantics ensure the relationship (from, to, TYPE) is created once; rerunning the same statement won’t duplicate edges.
+
 Notes
 
 - Label is required for CREATE statements. The { ... } properties block is optional.
 - MATCH returns rows (nodes or relationships) that match label and all provided key/value properties. Optional WHERE clauses can further filter results.
 - UUIDs are shown in the UI; copy/paste them for REL creation or DELETE operations.
-- Keys and values are strings; matching is exact. WHERE currently supports only simple predicates (see below) — no ranges, regex, partial/contains, arithmetic, or parentheses.
+- Keys and values are strings; matching is exact unless a numeric compare is applicable. Common string predicates (CONTAINS/STARTS WITH/ENDS WITH) are supported.
 - Commands are case-insensitive for the verb (CREATE/MATCH/DELETE/REL/NODE), but labels/keys/values are case-sensitive.
 
 Example queries
@@ -114,6 +158,8 @@ Example queries
 CREATE NODE Person {name:"Ada", role:"Engineer"};
 CREATE NODE Person {name:"Bob", role:"Designer"};
 CREATE NODE Company {name:"Acme"};
+
+![Cypher CREATE example](assets/graph_loom_cypher_create_snippet.png)
 
 2) Find all Person nodes
 
@@ -131,6 +177,14 @@ MATCH NODE Person {role:"Engineer"};
   MATCH NODE Person WHERE name="Ada" AND role!="Manager" AND HAS(nickname);
 - Combine with property block and label:
   MATCH NODE Person {role:"Engineer"} WHERE team="Platform";
+
+OpenCypher examples with RETURN and filtering:
+
+MATCH (m:Movie)
+WHERE m.released > 2000 AND m.title CONTAINS "Matrix"
+RETURN m.title
+ORDER BY m.title ASC
+LIMIT 10;
 
 4) Create a relationship (use real UUIDs from your nodes)
 
@@ -152,6 +206,26 @@ MATCH REL WORKS_AT WHERE HAS(since) AND since="2021";
 DELETE REL 01234567-89ab-cdef-0123-456789abcdef;
 DELETE NODE fedcba98-7654-3210-fedc-ba9876543210;
 
+7) Cypher-style pairwise relationship creation between all nodes with a given label
+
+MATCH (a:asdf), (b:asdf)
+WHERE id(a) < id(b)
+MERGE (a)-[:RELATED_TO]->(b);
+
+
+Multiline clauses are supported
+
+- You can place WHERE, DELETE, RETURN, MERGE, etc. on new lines after MATCH. For example:
+
+  MATCH (a:asdf)-[r:RELATED_TO]-(b:asdf)
+  DELETE r;
+
+  or
+
+  MATCH (a:asdf), (b:asdf)
+  WHERE id(a) < id(b)
+  MERGE (a)-[:RELATED_TO]->(b);
+
 
 Troubleshooting & Known Limitations
 
@@ -165,7 +239,7 @@ Troubleshooting & Known Limitations
   - The layout and physics are tuned for small-to-medium graphs. Extremely large graphs may feel sluggish.
 
 - Limited query language
-  - The GQL subset supports CREATE/MATCH/DELETE for NODE/REL with exact-match properties and basic WHERE clauses (id, label, has(key), key="v", key!="v", and for relationships from=<uuid>/to=<uuid>). No updates/SET, no pattern matching, multi-hop, variables, OR/NOT, or grouping/parentheses.
+  - The OpenCypher subset here is intentionally pragmatic. It covers the common cases outlined above but is not a full implementation. Complex boolean logic (OR/NOT), nested parentheses in WHERE, multi-branch path patterns, and regex are not supported. Variable-length patterns are supported in constrained forms.
 
 - UUIDs required for some operations
   - Relationship creation and deletes require UUIDs. Use MATCH first (or the UI) to identify ids.
@@ -186,3 +260,4 @@ Issues and PRs are welcome. Please run cargo fmt and cargo clippy before submitt
 
 ## License
 [Apache 2.0](https://github.com/jackpots28/Graph-Loom/blob/main/LICENSE)
+
