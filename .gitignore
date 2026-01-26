@@ -2,6 +2,9 @@
 /.idea
 !/assets/.gitkeep
 !/assets/logs/.gitkeep
+!/assets/AppSet.iconset/.gitkeep
+!/assets/AppSet.iconset
+!/assets/AppSet.icns
 
 /assets
 /assets/logs
