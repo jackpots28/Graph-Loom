@@ -1,6 +1,6 @@
 [package]
 name = "graph_loom"
-version = "1.1.0"
+version = "1.8.2"
 edition = "2024"
 
 authors = ["Jack Sims jack.m.sims@protonmail.com"]
@@ -12,8 +12,23 @@ repository = "https://github.com/jackpots28/Graph-Loom"
 keywords = ["graph", "visualization", "gui", "egui", "cypher"]
 categories = ["gui", "visualization", "data-structures", "development-tools"]
 
+[profile.release-lto]
+inherits = "release"
+lto = true
+
+[[bin]]
+name = "Graph-Loom"
+path = "src/main.rs"
+
+[package.metadata.bundle]
+name = "Graph-Loom"
+identifier = "com.labcore.graph-loom"
+icon = ["assets/AppSet.icns"]
+
 [features]
-api = ["dep:actix-web", "dep:clap"]
+default = ["api"]
+api = ["dep:actix-web", "dep:actix-web-actors", "dep:actix", "dep:clap"]
+cli = ["dep:tungstenite", "dep:clap", "dep:url", "dep:http", "dep:rustyline"]
 
 [dependencies]
 # GUI - Local Frontend Rendering
@@ -29,7 +44,19 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 anyhow = "1"
 serde_json = "1"
 csv = "1"
+once_cell = "1"
 
 # API - Backend Tooling | If serving GraphLoomDB standalone
 actix-web = { version = "4", optional = true }
+actix-web-actors = { version = "4", optional = true }
+actix = { version = "0.13", optional = true }
 clap = { version = "4", optional = true}
+tungstenite = { version = "0.21", optional = true }
+url = { version = "2", optional = true }
+http = { version = "1", optional = true }
+rustyline = { version = "14", optional = true }
+
+[[bin]]
+name = "glsh"
+path = "src/bin/glsh.rs"
+required-features = ["cli"]

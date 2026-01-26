@@ -1,4 +1,8 @@
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::excessive_precision)]
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
@@ -6,7 +10,10 @@ use uuid::Uuid;
 
 use crate::graph_utils::graph::{GraphDatabase, NodeId};
 use crate::persistence::persist::{self, AppStateFile};
+use crate::persistence::settings::AppSettings;
 use crate::gql::query_interface::{self, QueryResultRow};
+use crate::api::{self, ApiRequest};
+// All menus are implemented in-window via egui (no native menu plumbing)
 
 // Helpers for exporting matched nodes
 fn export_nodes_json(db: &GraphDatabase, ids: &[NodeId], path: &std::path::Path) -> std::io::Result<()> {
@@ -48,6 +55,108 @@ fn export_nodes_csv(db: &GraphDatabase, ids: &[NodeId], path: &std::path::Path) 
     Ok(())
 }
 
+// Helpers for exporting the entire graph
+fn export_graph_json(db: &GraphDatabase, path: &std::path::Path) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+    #[derive(serde::Serialize)]
+    struct RelRef<'a> {
+        rel_id: &'a uuid::Uuid,
+        label: &'a str,
+        peer: &'a uuid::Uuid,
+        direction: &'a str, // "out" or "in"
+    }
+    #[derive(serde::Serialize)]
+    struct NodeOut<'a> {
+        id: &'a uuid::Uuid,
+        label: &'a str,
+        metadata: &'a HashMap<String, String>,
+        out_rels: Vec<RelRef<'a>>,
+        in_rels: Vec<RelRef<'a>>,
+    }
+    #[derive(serde::Serialize)]
+    struct RelOut<'a> {
+        id: &'a uuid::Uuid,
+        from: &'a uuid::Uuid,
+        to: &'a uuid::Uuid,
+        label: &'a str,
+        metadata: &'a HashMap<String, String>,
+    }
+    #[derive(serde::Serialize)]
+    struct GraphOut<'a> {
+        nodes: Vec<NodeOut<'a>>,
+        relationships: Vec<RelOut<'a>>,
+    }
+
+    // Build per-node rel refs
+    let mut node_outs: Vec<NodeOut> = Vec::with_capacity(db.nodes.len());
+    for (_id, node) in db.nodes.iter() {
+        let mut out_rels: Vec<RelRef> = Vec::new();
+        let mut in_rels: Vec<RelRef> = Vec::new();
+        for rel in db.relationships.values() {
+            if rel.from_node == node.id {
+                out_rels.push(RelRef { rel_id: &rel.id, label: &rel.label, peer: &rel.to_node, direction: "out" });
+            } else if rel.to_node == node.id {
+                in_rels.push(RelRef { rel_id: &rel.id, label: &rel.label, peer: &rel.from_node, direction: "in" });
+            }
+        }
+        node_outs.push(NodeOut { id: &node.id, label: &node.label, metadata: &node.metadata, out_rels, in_rels });
+    }
+    let mut rel_outs: Vec<RelOut> = Vec::with_capacity(db.relationships.len());
+    for (_rid, rel) in db.relationships.iter() {
+        rel_outs.push(RelOut { id: &rel.id, from: &rel.from_node, to: &rel.to_node, label: &rel.label, metadata: &rel.metadata });
+    }
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let f = File::create(path)?;
+    let g = GraphOut { nodes: node_outs, relationships: rel_outs };
+    serde_json::to_writer_pretty(f, &g).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    // newline at end
+    let mut f2 = std::fs::OpenOptions::new().append(true).open(path)?;
+    let _ = f2.write_all(b"\n");
+    Ok(())
+}
+
+fn export_graph_csv(db: &GraphDatabase, base_path: &std::path::Path) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    // Derive nodes/relationships file paths from base
+    let parent = base_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let stem = base_path.file_stem().and_then(|s| s.to_str()).unwrap_or("graph");
+    let nodes_path = parent.join(format!("{}_nodes.csv", stem));
+    let rels_path = parent.join(format!("{}_relationships.csv", stem));
+    // Write nodes CSV: id,label,metadata_json,out_rels_json,in_rels_json
+    {
+        let mut wtr = csv::Writer::from_path(&nodes_path)?;
+        wtr.write_record(["id", "label", "metadata_json", "out_rels_json", "in_rels_json"])?;
+        for (_id, n) in db.nodes.iter() {
+            let meta_json = serde_json::to_string(&n.metadata).unwrap_or_else(|_| "{}".into());
+            let mut out_refs: Vec<serde_json::Value> = Vec::new();
+            let mut in_refs: Vec<serde_json::Value> = Vec::new();
+            for rel in db.relationships.values() {
+                if rel.from_node == n.id {
+                    out_refs.push(serde_json::json!({"rel_id": rel.id, "label": rel.label, "to": rel.to_node}));
+                } else if rel.to_node == n.id {
+                    in_refs.push(serde_json::json!({"rel_id": rel.id, "label": rel.label, "from": rel.from_node}));
+                }
+            }
+            let out_json = serde_json::to_string(&out_refs).unwrap_or_else(|_| "[]".into());
+            let in_json = serde_json::to_string(&in_refs).unwrap_or_else(|_| "[]".into());
+            wtr.write_record(&[n.id.to_string(), n.label.clone(), meta_json, out_json, in_json])?;
+        }
+        wtr.flush()?;
+    }
+    // Write relationships CSV: id,from,to,label,metadata_json
+    {
+        let mut wtr = csv::Writer::from_path(&rels_path)?;
+        wtr.write_record(["id", "from", "to", "label", "metadata_json"])?;
+        for (_rid, r) in db.relationships.iter() {
+            let meta_json = serde_json::to_string(&r.metadata).unwrap_or_else(|_| "{}".into());
+            wtr.write_record(&[r.id.to_string(), r.from_node.to_string(), r.to_node.to_string(), r.label.clone(), meta_json])?;
+        }
+        wtr.flush()?;
+    }
+    Ok((nodes_path, rels_path))
+}
+
 // Style for toast notifications
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -80,6 +189,12 @@ enum NewNodeRelDir {
 enum SidebarMode {
     Tooling,
     Query,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PrefsTab {
+    App,
+    Api,
 }
 
 pub struct GraphApp {
@@ -137,6 +252,9 @@ pub struct GraphApp {
     // Bulk edit / multi-select state
     multi_select_active: bool,
     multi_selected_nodes: HashSet<NodeId>,
+    // Rectangle (rubber-band) selection while in multi-select mode
+    rect_select_start: Option<Pos2>,
+    rect_select_current: Option<Pos2>,
     bulk_add_key: String,
     bulk_add_value: String,
     bulk_delete_keys: String,
@@ -155,6 +273,11 @@ pub struct GraphApp {
     query_export_is_json: bool,
     query_export_path: String,
     query_export_status: Option<String>,
+    // Export entire graph modal
+    show_export_all_window: bool,
+    export_all_is_json: bool,
+    export_all_path: String,
+    export_all_status: Option<String>,
     // Query suggestions
     query_suggest_visible: bool,
     query_suggest_items: Vec<String>,
@@ -163,9 +286,9 @@ pub struct GraphApp {
     // Layout control
     re_cluster_pending: bool,
     // Cluster convergence controls (helps separate large groups visually)
-    cluster_converge_enabled: bool,
-    cluster_converge_threshold: usize,
-    cluster_converge_strength: f32,
+    _cluster_converge_enabled: bool,
+    _cluster_converge_threshold: usize,
+    _cluster_converge_strength: f32,
     gravity_enabled: bool,
     gravity_strength: f32,
     // Center-of-mass (COM) local gravity settings
@@ -177,8 +300,8 @@ pub struct GraphApp {
     lod_label_min_zoom: f32,
     lod_hide_labels_node_threshold: usize,
     // Edge label readability controls
-    edge_labels_enabled: bool,
-    edge_labels_only_on_hover: bool,
+    _edge_labels_enabled: bool,
+    _edge_labels_only_on_hover: bool,
     edge_label_min_zoom: f32,
     edge_label_count_threshold: usize,
     edge_label_bg_alpha: u8,
@@ -186,11 +309,27 @@ pub struct GraphApp {
     hover_node: Option<NodeId>,
     // Transient zoom HUD (show current zoom briefly when scrolling)
     zoom_hud_until: Option<Instant>,
+    // App settings and Preferences UI state
+    app_settings: AppSettings,
+    show_prefs_window: bool,
+    prefs_edit: AppSettings,
+    prefs_status: Option<String>,
+    prefs_autosave_override_str: String,
+    // Preferences: export directory override editor buffer
+    prefs_export_override_str: String,
+    // Preferences: which tab is active in the Preferences window
+    prefs_tab: PrefsTab,
+    // Preferences: API log directory override editor buffer
+    prefs_api_log_override_str: String,
+    // API server runtime
+    api_rx: Option<Receiver<ApiRequest>>,
+    api_running: bool,
 }
 
 impl GraphApp {
     pub fn new(db: GraphDatabase) -> Self {
-        Self {
+        let settings = AppSettings::load().unwrap_or_default();
+        let mut s = Self {
             db,
             node_positions: HashMap::new(),
             node_velocities: HashMap::new(),
@@ -232,6 +371,8 @@ impl GraphApp {
             rel_meta_new_kv: HashMap::new(),
             multi_select_active: false,
             multi_selected_nodes: HashSet::new(),
+            rect_select_start: None,
+            rect_select_current: None,
             bulk_add_key: String::new(),
             bulk_add_value: String::new(),
             bulk_delete_keys: String::new(),
@@ -246,14 +387,18 @@ impl GraphApp {
             query_export_is_json: true,
             query_export_path: String::new(),
             query_export_status: None,
+            show_export_all_window: false,
+            export_all_is_json: true,
+            export_all_path: String::new(),
+            export_all_status: None,
             query_suggest_visible: false,
             query_suggest_items: Vec::new(),
             query_suggest_index: 0,
             query_suggest_hover_index: None,
             re_cluster_pending: true,
-            cluster_converge_enabled: false, // deprecated in favor of gravity/repulsion aids
-            cluster_converge_threshold: 30,
-            cluster_converge_strength: 3.0,
+            _cluster_converge_enabled: false, // deprecated in favor of gravity/repulsion aids
+            _cluster_converge_threshold: 30,
+            _cluster_converge_strength: 3.0,
             gravity_enabled: false,
             gravity_strength: 6.0,
             com_gravity_radius: 150.0,
@@ -262,14 +407,36 @@ impl GraphApp {
             lod_enabled: true,
             lod_label_min_zoom: 0.7,
             lod_hide_labels_node_threshold: 200,
-            edge_labels_enabled: true,
-            edge_labels_only_on_hover: false,
+            _edge_labels_enabled: true,
+            _edge_labels_only_on_hover: false,
             edge_label_min_zoom: 0.8,
             edge_label_count_threshold: 500,
             edge_label_bg_alpha: 170,
             hover_node: None,
             zoom_hud_until: None,
+            app_settings: settings.clone(),
+            show_prefs_window: false,
+            prefs_edit: AppSettings::default(),
+            prefs_status: None,
+            prefs_autosave_override_str: String::new(),
+            prefs_export_override_str: String::new(),
+            prefs_tab: PrefsTab::App,
+            prefs_api_log_override_str: String::new(),
+            api_rx: None,
+            api_running: false,
+        };
+        // Apply settings to runtime toggles
+        s.lod_enabled = s.app_settings.lod_enabled;
+        s.lod_label_min_zoom = s.app_settings.lod_label_min_zoom;
+        s.lod_hide_labels_node_threshold = s.app_settings.lod_hide_labels_node_threshold;
+        // Initialize API broker and server based on settings
+        let rx = api::init_broker();
+        s.api_rx = Some(rx);
+        if s.app_settings.api_enabled {
+            let _ = api::server::start_server(&s.app_settings);
+            s.api_running = true;
         }
+        s
     }
 
     fn ensure_layout(&mut self, rect: Rect) {
@@ -398,7 +565,10 @@ impl GraphApp {
                     let w = similarity(u, v, &mut sim_cache);
                     *scores.entry(c).or_insert(0.0) += w;
                 }
-                if let Some((&best_comm, _)) = scores.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()) {
+                if let Some((&best_comm, _)) = scores
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                {
                     let cur = community.get(&u).copied().unwrap_or(u);
                     if best_comm != cur {
                         community.insert(u, best_comm);
@@ -460,7 +630,9 @@ impl GraphApp {
         // Within each community, spread nodes around its centroid
         let mut out: Map<NodeId, Pos2> = Map::new();
         for (cid, nodes) in &groups {
-            let centroid = *comm_centroids.get(cid).unwrap();
+            let centroid = *comm_centroids
+                .get(cid)
+                .unwrap_or(&center); // fallback to center if missing (shouldn't happen)
             let n = nodes.len().max(1) as f32;
             // local radius scales with community size while also being capped
             let local_r_base = (min_dim * 0.08).min(30.0 + 6.0 * n.sqrt());
@@ -489,6 +661,7 @@ impl GraphApp {
     // Label-centric target layout: place one centroid per distinct node label around a ring,
     // then distribute nodes of that label in a small local spiral around the centroid.
     // Returns a target position per node id.
+    #[allow(dead_code)]
     fn compute_label_layout(&self, rect: Rect) -> HashMap<NodeId, Pos2> {
         use std::collections::HashMap as Map;
         let mut by_label: Map<String, Vec<NodeId>> = Map::new();
@@ -584,8 +757,10 @@ impl GraphApp {
                         for &a in ids {
                             for &b in neigh_ids {
                                 if a >= b { continue; } // avoid double-processing and self
-                                let pa = *self.node_positions.get(&a).unwrap();
-                                let pb = *self.node_positions.get(&b).unwrap();
+                                let (Some(&pa), Some(&pb)) = (
+                                    self.node_positions.get(&a),
+                                    self.node_positions.get(&b),
+                                ) else { continue; };
                                 let dx = pb.x - pa.x;
                                 let dy = pb.y - pa.y;
                                 let d2 = dx*dx + dy*dy;
@@ -629,7 +804,8 @@ impl GraphApp {
 
     pub fn from_state(state: AppStateFile) -> Self {
         let (db, positions, pan, zoom) = state.to_runtime();
-        Self {
+        let settings = AppSettings::load().unwrap_or_default();
+        let mut s = Self {
             db,
             node_positions: positions,
             node_velocities: HashMap::new(),
@@ -671,6 +847,8 @@ impl GraphApp {
             rel_meta_new_kv: HashMap::new(),
             multi_select_active: false,
             multi_selected_nodes: HashSet::new(),
+            rect_select_start: None,
+            rect_select_current: None,
             bulk_add_key: String::new(),
             bulk_add_value: String::new(),
             bulk_delete_keys: String::new(),
@@ -685,14 +863,18 @@ impl GraphApp {
             query_export_is_json: true,
             query_export_path: String::new(),
             query_export_status: None,
+            show_export_all_window: false,
+            export_all_is_json: true,
+            export_all_path: String::new(),
+            export_all_status: None,
             query_suggest_visible: false,
             query_suggest_items: Vec::new(),
             query_suggest_index: 0,
             query_suggest_hover_index: None,
             re_cluster_pending: true,
-            cluster_converge_enabled: false,
-            cluster_converge_threshold: 30,
-            cluster_converge_strength: 3.0,
+            _cluster_converge_enabled: false,
+            _cluster_converge_threshold: 30,
+            _cluster_converge_strength: 3.0,
             gravity_enabled: false,
             gravity_strength: 6.0,
             com_gravity_radius: 150.0,
@@ -701,14 +883,36 @@ impl GraphApp {
             lod_enabled: true,
             lod_label_min_zoom: 0.7,
             lod_hide_labels_node_threshold: 200,
-            edge_labels_enabled: true,
-            edge_labels_only_on_hover: false,
+            _edge_labels_enabled: true,
+            _edge_labels_only_on_hover: false,
             edge_label_min_zoom: 0.8,
             edge_label_count_threshold: 500,
             edge_label_bg_alpha: 170,
             hover_node: None,
             zoom_hud_until: None,
+            app_settings: settings.clone(),
+            show_prefs_window: false,
+            prefs_edit: AppSettings::default(),
+            prefs_status: None,
+            prefs_autosave_override_str: String::new(),
+            prefs_export_override_str: String::new(),
+            prefs_tab: PrefsTab::App,
+            prefs_api_log_override_str: String::new(),
+            api_rx: None,
+            api_running: false,
+        };
+        // Apply settings to runtime toggles
+        s.lod_enabled = s.app_settings.lod_enabled;
+        s.lod_label_min_zoom = s.app_settings.lod_label_min_zoom;
+        s.lod_hide_labels_node_threshold = s.app_settings.lod_hide_labels_node_threshold;
+        // Initialize API broker and server based on settings
+        let rx = api::init_broker();
+        s.api_rx = Some(rx);
+        if s.app_settings.api_enabled {
+            let _ = api::server::start_server(&s.app_settings);
+            s.api_running = true;
         }
+        s
     }
 
     fn mark_dirty(&mut self) {
@@ -777,110 +981,485 @@ impl GraphApp {
         self.node_positions.insert(id, pos);
         pos
     }
+
+    // Public helpers callable from native (OS) menu integrations
+    pub fn menu_save(&mut self) { self.save_now(); }
+
+    pub fn menu_save_version(&mut self) { self.save_versioned_now(); }
+
+    pub fn menu_load_latest(&mut self) {
+        match persist::load_active() {
+            Ok(Some(state)) => {
+                let (db, pos, pan, zoom) = state.to_runtime();
+                self.db = db; self.node_positions = pos; self.pan = pan; self.zoom = zoom;
+                self.selected = None; self.open_node_windows.clear(); self.open_rel_windows.clear();
+                self.dirty = false; self.last_change = Instant::now();
+                self.last_save_info = Some("Loaded latest state".into());
+                self.last_info_time = Some(Instant::now());
+                self.last_info_style = NoticeStyle::Prominent;
+                self.save_error = None;
+            }
+            Ok(None) => { self.save_error = Some("No active state file found".into()); }
+            Err(e) => { self.save_error = Some(format!("Load failed: {}", e)); }
+        }
+    }
+
+    pub fn menu_new_graph(&mut self) {
+        // Back up existing graph if it's non-empty
+        let had_content = !self.db.nodes.is_empty() || !self.db.relationships.is_empty();
+        if had_content { self.save_versioned_now(); }
+
+        // Reset runtime to a fresh, empty graph
+        self.db = GraphDatabase::new();
+        self.node_positions.clear();
+        self.node_velocities.clear();
+        self.selected = None;
+        self.dragging = None;
+        self.open_node_windows.clear();
+        self.open_rel_windows.clear();
+        self.multi_selected_nodes.clear();
+        self.pick_target = None;
+        self.create_rel_from = None;
+        self.create_rel_to = None;
+        self.pending_new_node_for_link = None;
+        self.pan = Vec2::ZERO;
+        self.zoom = 1.0;
+        self.re_cluster_pending = true;
+        self.converge_start = Some(Instant::now());
+        self.dirty = true;
+        self.last_change = Instant::now();
+        self.save_error = None;
+        self.last_info_time = Some(Instant::now());
+        self.last_info_style = NoticeStyle::Prominent;
+        self.last_save_info = Some(
+            if had_content { "Created new empty graph (backup saved)" } else { "Created new empty graph" }
+                .to_string(),
+        );
+    }
+
+    pub fn menu_reset_view(&mut self) {
+        self.pan = Vec2::ZERO;
+        self.zoom = 1.0;
+        self.mark_dirty();
+    }
+
+    pub fn menu_open_prefs(&mut self) {
+        // Prepare editable copy and open the window
+        self.prefs_edit = self.app_settings.clone();
+        self.prefs_autosave_override_str = match &self.prefs_edit.autosave_override {
+            Some(p) => p.display().to_string(),
+            None => String::new(),
+        };
+        self.prefs_export_override_str = match &self.prefs_edit.export_override {
+            Some(p) => p.display().to_string(),
+            None => String::new(),
+        };
+        self.prefs_api_log_override_str = match &self.prefs_edit.api_log_override {
+            Some(p) => p.display().to_string(),
+            None => String::new(),
+        };
+        self.prefs_tab = PrefsTab::App;
+        self.prefs_status = None;
+        self.show_prefs_window = true;
+    }
+
 }
 
 impl eframe::App for GraphApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process pending API requests (execute queries on the GUI thread safely)
+        if let Some(rx) = &self.api_rx {
+            for req in rx.try_iter() {
+                let t0 = std::time::Instant::now();
+                // Execute query on GUI thread
+                let res = match &req.params {
+                    Some(p) => query_interface::execute_query_with_params(&mut self.db, &req.query, p),
+                    None => query_interface::execute_and_log(&mut self.db, &req.query),
+                };
+                let dt = t0.elapsed();
+                // Debug print for visibility in console during development
+                eprintln!(
+                    "[API GUI] RID={} done mutated={} dt_ms={}",
+                    req.request_id,
+                    res.as_ref().map(|o| o.mutated).unwrap_or(false),
+                    dt.as_millis()
+                );
+                // Best effort respond; ignore send errors if client disconnected
+                let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
+            }
+        }
+        // Native menu command handling removed; in-window menus cover these actions
+
+        // Preferences window
+        if self.show_prefs_window {
+            let mut open = true;
+            egui::Window::new("Preferences")
+                .open(&mut open)
+                .resizable(true)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    // Tabs: App vs API
+                    ui.horizontal(|ui| {
+                        let app_sel = self.prefs_tab == PrefsTab::App;
+                        if ui.selectable_label(app_sel, "App Settings").clicked() { self.prefs_tab = PrefsTab::App; }
+                        let api_sel = self.prefs_tab == PrefsTab::Api;
+                        if ui.selectable_label(api_sel, "API Settings").clicked() { self.prefs_tab = PrefsTab::Api; }
+                    });
+                    ui.separator();
+
+                    match self.prefs_tab {
+                        PrefsTab::App => {
+                            ui.heading("General");
+                            ui.separator();
+
+                            // Autosave directory override
+                            ui.label("Autosave directory (leave empty for OS default):");
+                            let resp = ui.text_edit_singleline(&mut self.prefs_autosave_override_str);
+                            if resp.lost_focus() {
+                                // no-op; parse on Save
+                            }
+                            if ui.button("Clear to default (OS temp)").clicked() {
+                                self.prefs_autosave_override_str.clear();
+                            }
+
+                            ui.add_space(8.0);
+                            // Export directory override
+                            ui.label("Export directory (leave empty for OS temp):");
+                            let resp2 = ui.text_edit_singleline(&mut self.prefs_export_override_str);
+                            if resp2.lost_focus() {
+                                // no-op; parse on Save
+                            }
+                            if ui.button("Clear to default (OS temp)").clicked() {
+                                self.prefs_export_override_str.clear();
+                            }
+
+                            ui.add_space(8.0);
+                            // Show where the settings file is stored on this system (read-only info)
+                            let settings_dir = AppSettings::settings_dir();
+                            ui.label("Settings save directory:");
+                            ui.monospace(settings_dir.display().to_string());
+
+                            ui.add_space(4.0);
+                            // Show effective export directory that will be used when path is not specified
+                            let eff_export = if self.prefs_export_override_str.trim().is_empty() {
+                                AppSettings::export_default_dir()
+                            } else {
+                                std::path::PathBuf::from(self.prefs_export_override_str.trim())
+                            };
+                            ui.label("Effective export default directory:");
+                            ui.monospace(eff_export.display().to_string());
+
+                            ui.separator();
+                            ui.heading("Rendering / LOD");
+                            ui.checkbox(&mut self.prefs_edit.lod_enabled, "Enable level-of-detail (LOD)");
+                            ui.add(egui::Slider::new(&mut self.prefs_edit.lod_label_min_zoom, 0.1..=3.0).text("Label min zoom"));
+                            ui.add(egui::Slider::new(&mut self.prefs_edit.lod_hide_labels_node_threshold, 0..=5000).text("Hide labels above N nodes"));
+                        }
+                        PrefsTab::Api => {
+                            ui.heading("API Service");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.prefs_edit.api_enabled, "Enable API Server");
+                                ui.small("Requires restart if port is in use by a previous run");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Bind address");
+                                ui.text_edit_singleline(&mut self.prefs_edit.api_bind_addr);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Port");
+                                let mut port = self.prefs_edit.api_port as i32;
+                                if ui.add(egui::DragValue::new(&mut port).range(1..=65535)).changed() {
+                                    self.prefs_edit.api_port = port as u16;
+                                }
+                                ui.label(format!("Endpoint: {}", self.prefs_edit.api_endpoint()));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("API Key (optional)");
+                                let mut key = self.prefs_edit.api_key.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut key).changed() {
+                                    if key.trim().is_empty() { self.prefs_edit.api_key = None; } else { self.prefs_edit.api_key = Some(key.clone()); }
+                                }
+                                if ui.button("Clear").clicked() { self.prefs_edit.api_key = None; }
+                            });
+
+                            ui.add_space(6.0);
+                            ui.label("API log directory (leave empty for OS temp):");
+                            let _ = ui.text_edit_singleline(&mut self.prefs_api_log_override_str);
+                            if ui.button("Clear to default (OS temp)").clicked() {
+                                self.prefs_api_log_override_str.clear();
+                            }
+                            let eff_api_log = if self.prefs_api_log_override_str.trim().is_empty() {
+                                AppSettings::api_log_default_dir()
+                            } else {
+                                std::path::PathBuf::from(self.prefs_api_log_override_str.trim())
+                            };
+                            ui.small(format!("Effective API log dir: {}", eff_api_log.display()));
+                        }
+                    }
+
+                    if let Some(msg) = &self.prefs_status {
+                        ui.separator();
+                        ui.label(msg);
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            // Apply autosave path
+                            self.prefs_edit.autosave_override = if self.prefs_autosave_override_str.trim().is_empty() {
+                                None
+                            } else {
+                                Some(std::path::PathBuf::from(self.prefs_autosave_override_str.trim()))
+                            };
+                            // Apply export path
+                            self.prefs_edit.export_override = if self.prefs_export_override_str.trim().is_empty() {
+                                None
+                            } else {
+                                Some(std::path::PathBuf::from(self.prefs_export_override_str.trim()))
+                            };
+                            // Apply API log path
+                            self.prefs_edit.api_log_override = if self.prefs_api_log_override_str.trim().is_empty() {
+                                None
+                            } else {
+                                Some(std::path::PathBuf::from(self.prefs_api_log_override_str.trim()))
+                            };
+                            // Persist
+                            match self.prefs_edit.save() {
+                                Ok(()) => {
+                                    // Determine if API server config changed
+                                    let old_api = (self.app_settings.api_enabled.clone(), self.app_settings.api_bind_addr.clone(), self.app_settings.api_port, self.app_settings.api_key.clone());
+                                    // Detect export dir change to refresh default export paths in views
+                                    let old_export_dir = self.app_settings.export_dir();
+                                    self.app_settings = self.prefs_edit.clone();
+                                    // Apply to runtime
+                                    self.lod_enabled = self.app_settings.lod_enabled;
+                                    self.lod_label_min_zoom = self.app_settings.lod_label_min_zoom;
+                                    self.lod_hide_labels_node_threshold = self.app_settings.lod_hide_labels_node_threshold;
+                                    let new_api = (self.app_settings.api_enabled.clone(), self.app_settings.api_bind_addr.clone(), self.app_settings.api_port, self.app_settings.api_key.clone());
+                                    if old_api != new_api {
+                                        // Restart server
+                                        api::server::stop_server();
+                                        if self.app_settings.api_enabled {
+                                            let _ = api::server::start_server(&self.app_settings);
+                                            self.api_running = true;
+                                        } else {
+                                            self.api_running = false;
+                                        }
+                                    }
+
+                                    let new_export_dir = self.app_settings.export_dir();
+                                    if old_export_dir != new_export_dir {
+                                        // If export_all_path is empty or under old dir, regenerate under new dir
+                                        let refresh_export_all = self.export_all_path.is_empty() || {
+                                            let p = std::path::Path::new(&self.export_all_path);
+                                            p.starts_with(&old_export_dir)
+                                        };
+                                        if refresh_export_all {
+                                            let now = time::OffsetDateTime::now_utc();
+                                            let fmt = time::macros::format_description!("[year][month][day]_[hour][minute][second]");
+                                            let stamp = now.format(&fmt).unwrap_or_else(|_| "now".into());
+                                            let ext = if self.export_all_is_json { "json" } else { "csv" };
+                                            let mut base = new_export_dir.clone();
+                                            base.push(format!("graph_export_{}.{}", stamp, ext));
+                                            self.export_all_path = base.display().to_string();
+                                        }
+                                        // If query_export_path is empty or under old dir, regenerate under new dir
+                                        let refresh_query = self.query_export_path.is_empty() || {
+                                            let p = std::path::Path::new(&self.query_export_path);
+                                            p.starts_with(&old_export_dir)
+                                        };
+                                        if refresh_query {
+                                            let now = time::OffsetDateTime::now_utc();
+                                            let fmt = time::macros::format_description!("[year][month][day]_[hour][minute][second]");
+                                            let stamp = now.format(&fmt).unwrap_or_else(|_| "now".into());
+                                            let ext = if self.query_export_is_json { "json" } else { "csv" };
+                                            let mut base = new_export_dir;
+                                            base.push(format!("query_export_{}.{}", stamp, ext));
+                                            self.query_export_path = base.display().to_string();
+                                        }
+                                    }
+                                    self.last_save_info = Some("Preferences saved".into());
+                                    self.last_info_time = Some(Instant::now());
+                                    self.last_info_style = NoticeStyle::Prominent;
+                                    self.show_prefs_window = false;
+                                }
+                                Err(e) => {
+                                    self.prefs_status = Some(format!("Failed to save preferences: {}", e));
+                                }
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_prefs_window = false;
+                        }
+                    });
+                });
+            if !open { self.show_prefs_window = false; }
+        }
+
+        // Export Entire Graph modal
+        if self.show_export_all_window {
+            let mut open = true;
+            egui::Window::new("Export Graph")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.label("Choose export format and destination path.");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Format:");
+                        let mut changed = false;
+                        if ui.selectable_label(self.export_all_is_json, "JSON").clicked() {
+                            if !self.export_all_is_json { self.export_all_is_json = true; changed = true; }
+                        }
+                        if ui.selectable_label(!self.export_all_is_json, "CSV").clicked() {
+                            if self.export_all_is_json { self.export_all_is_json = false; changed = true; }
+                        }
+                        if changed {
+                            // Update extension hint
+                            let desired_ext = if self.export_all_is_json { ".json" } else { ".csv" };
+                            if self.export_all_path.is_empty() {
+                                let now = time::OffsetDateTime::now_utc();
+                                let fmt = time::macros::format_description!("[year][month][day]_[hour][minute][second]");
+                                let stamp = now.format(&fmt).unwrap_or_else(|_| "now".into());
+                                let mut base = self.app_settings.export_dir();
+                                base.push(format!("graph_export_{}{}", stamp, desired_ext));
+                                self.export_all_path = base.display().to_string();
+                            } else {
+                                // Swap extension if present
+                                if let Some(p) = std::path::Path::new(&self.export_all_path).file_stem() {
+                                    let parent = std::path::Path::new(&self.export_all_path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                                    let stem = p.to_string_lossy();
+                                    self.export_all_path = parent.join(format!("{}{}", stem, desired_ext)).display().to_string();
+                                }
+                            }
+                        }
+                    });
+                    if self.export_all_path.is_empty() {
+                        let now = time::OffsetDateTime::now_utc();
+                        let fmt = time::macros::format_description!("[year][month][day]_[hour][minute][second]");
+                        let stamp = now.format(&fmt).unwrap_or_else(|_| "now".into());
+                        let ext = if self.export_all_is_json { "json" } else { "csv" };
+                        let mut base = self.app_settings.export_dir();
+                        base.push(format!("graph_export_{}.{}", stamp, ext));
+                        self.export_all_path = base.display().to_string();
+                    }
+                    ui.label("Save to:");
+                    ui.text_edit_singleline(&mut self.export_all_path);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Export").clicked() {
+                            let path = std::path::PathBuf::from(self.export_all_path.clone());
+                            let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+                            let res_msg = if let Err(e) = std::fs::create_dir_all(&parent) {
+                                Err(format!("Failed to create directory: {}", e))
+                            } else if self.export_all_is_json {
+                                match export_graph_json(&self.db, &path) {
+                                    Ok(()) => Ok(format!("Exported JSON to {}", path.display())),
+                                    Err(e) => Err(format!("Export failed: {}", e)),
+                                }
+                            } else {
+                                match export_graph_csv(&self.db, &path) {
+                                    Ok((np, rp)) => Ok(format!("Exported CSV files: {} and {}", np.display(), rp.display())),
+                                    Err(e) => Err(format!("Export failed: {}", e)),
+                                }
+                            };
+                            self.export_all_status = Some(res_msg.unwrap_or_else(|e| e));
+                        }
+                        if ui.button("Cancel").clicked() { self.show_export_all_window = false; }
+                    });
+                    if let Some(msg) = &self.export_all_status { ui.separator(); ui.small(msg.clone()); }
+                });
+            if !open { self.show_export_all_window = false; }
+        }
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            // Check for keyboard shortcuts
+            if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S))) {
+                self.menu_save();
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S))) {
+                self.menu_save_version();
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N))) {
+                self.menu_new_graph();
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O))) {
+                self.menu_load_latest();
+            }
+
             // Use compact menus so options remain accessible regardless of width
             ui.horizontal(|ui| {
                 ui.label("Graph-Loom");
-                ui.menu_button("File", |ui| {
-                    if ui.button("Save").clicked() {
-                        self.save_now();
-                    }
-                    if ui.button("New Graph").clicked() {
-                        // Back up existing graph if it's non-empty
-                        let had_content = !self.db.nodes.is_empty() || !self.db.relationships.is_empty();
-                        if had_content {
-                            self.save_versioned_now();
-                        }
 
-                        // Reset runtime to a fresh, empty graph
-                        self.db = GraphDatabase::new();
-                        self.node_positions.clear();
-                        self.node_velocities.clear();
-                        self.selected = None;
-                        self.dragging = None;
-                        self.open_node_windows.clear();
-                        self.open_rel_windows.clear();
-                        self.multi_selected_nodes.clear();
-                        self.pick_target = None;
-                        self.create_rel_from = None;
-                        self.create_rel_to = None;
-                        self.pending_new_node_for_link = None;
-                        self.pan = Vec2::ZERO;
-                        self.zoom = 1.0;
-                        self.re_cluster_pending = true;
-                        self.converge_start = Some(Instant::now());
-                        self.dirty = true;
-                        self.last_change = Instant::now();
-                        self.save_error = None;
-                        self.last_info_time = Some(Instant::now());
-                        self.last_info_style = NoticeStyle::Prominent;
-                        self.last_save_info = Some(
-                            if had_content { "Created new empty graph (backup saved)" } else { "Created new empty graph" }
-                                .to_string(),
-                        );
-                        // menu will auto-close on click in recent egui versions
+                // File menu:
+                ui.menu_button("File", |ui| {
+                    if ui.add(egui::Button::new("Save").shortcut_text(ctx.format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S)))).clicked() {
+                        self.menu_save();
+                        ui.close();
                     }
-                    if ui.button("Save Versioned Copy").clicked() {
-                        self.save_versioned_now();
+                    if ui.add(egui::Button::new("Save As").shortcut_text(ctx.format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S)))).clicked() {
+                        self.menu_save_version();
+                        ui.close();
                     }
-                    if ui.button("Load Latest").clicked() {
-                        match persist::load_active() {
-                            Ok(Some(state)) => {
-                                // replace runtime
-                                let (db, pos, pan, zoom) = state.to_runtime();
-                                self.db = db; self.node_positions = pos; self.pan = pan; self.zoom = zoom;
-                                self.selected = None; self.open_node_windows.clear(); self.open_rel_windows.clear();
-                                self.dirty = false; self.last_change = Instant::now();
-                                self.last_save_info = Some("Loaded latest state".into());
-                                self.last_info_time = Some(Instant::now());
-                                self.last_info_style = NoticeStyle::Prominent;
-                                self.save_error = None;
-                            }
-                            Ok(None) => { self.save_error = Some("No active state file found".into()); }
-                            Err(e) => { self.save_error = Some(format!("Load failed: {}", e)); }
+                    if ui.button("Export Graph…").clicked() {
+                        // Open modal to export the entire graph
+                        self.show_export_all_window = true;
+                        // Initialize default path if empty
+                        if self.export_all_path.is_empty() {
+                            let now = time::OffsetDateTime::now_utc();
+                            let fmt = time::macros::format_description!("[year][month][day]_[hour][minute][second]");
+                            let stamp = now.format(&fmt).unwrap_or_else(|_| "now".into());
+                            let ext = if self.export_all_is_json { "json" } else { "csv" };
+                            let mut base = self.app_settings.export_dir();
+                            base.push(format!("graph_export_{}.{}", stamp, ext));
+                            self.export_all_path = base.display().to_string();
                         }
-                        // menu will auto-close on click in recent egui versions
+                        ui.close();
                     }
-                    if ui.button("Load Version…").clicked() { self.show_load_versions = true; }
+                    if ui.add(egui::Button::new("Load Latest").shortcut_text(ctx.format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O)))).clicked() {
+                        self.menu_load_latest();
+                        ui.close();
+                    }
+                    if ui.button("Load Version…").clicked() {
+                        self.show_load_versions = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("New Graph").shortcut_text(ctx.format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N)))).clicked() {
+                        self.menu_new_graph();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Quit").shortcut_text(ctx.format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q)))).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.close();
+                    }
                 });
 
                 ui.menu_button("View", |ui| {
-                    if ui.button("Reset View").clicked() {
-                        self.pan = Vec2::ZERO;
-                        self.zoom = 1.0;
-                        self.mark_dirty();
+                    if ui.add(egui::Button::new("Reset View").shortcut_text(ctx.format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Num0)))).clicked() {
+                        self.menu_reset_view();
+                        ui.close();
                     }
                     ui.separator();
                     ui.label("Zoom");
                     ui.add(egui::Slider::new(&mut self.zoom, 0.25..=2.0).clamping(egui::SliderClamping::Always));
                 });
 
-                ui.menu_button("Sidebar", |ui| {
-                    let toggle = if self.sidebar_open { "Hide Sidebar" } else { "Show Sidebar" };
-                    if ui.button(toggle).clicked() {
+
+                ui.menu_button("Window", |ui| {
+                    let toggle_sidebar = if self.sidebar_open { "Hide Sidebar" } else { "Show Sidebar" };
+                    if ui.button(toggle_sidebar).clicked() {
+                        // Leaving/entering a view: clear all selections for consistency
+                        self.deselect_all();
                         // If hiding the sidebar, end bulk-select mode
                         if self.sidebar_open {
                             self.multi_select_active = false;
                         }
                         self.sidebar_open = !self.sidebar_open;
+                        ui.close();
                     }
                     ui.separator();
-                    ui.label("Mode");
-                    if ui.selectable_label(self.sidebar_mode == SidebarMode::Tooling, "Tooling").clicked() {
-                        self.sidebar_mode = SidebarMode::Tooling;
-                    }
-                    if ui.selectable_label(self.sidebar_mode == SidebarMode::Query, "Query").clicked() {
-                        // Switching away from tooling: disable bulk select if active
-                        self.multi_select_active = false;
-                        self.sidebar_mode = SidebarMode::Query;
-                    }
-                });
-
-                ui.menu_button("Window", |ui| {
                     ui.label(format!(
                         "Open pop-outs: nodes {} | rels {}",
                         self.open_node_windows.len(),
@@ -895,6 +1474,14 @@ impl eframe::App for GraphApp {
                     }
                 });
 
+                // Settings/Preferences
+                ui.menu_button("Settings", |ui| {
+                    if ui.button("Preferences…").clicked() {
+                        self.menu_open_prefs();
+                        ui.close();
+                    }
+                });
+
                 // Keep a tiny status label; avoid long texts to prevent hiding on small widths
                 ui.small(format!("N:{} R:{}", self.db.nodes.len(), self.db.relationships.len()));
                 if let Some(err) = &self.save_error { ui.separator(); ui.colored_label(Color32::RED, err); }
@@ -902,20 +1489,42 @@ impl eframe::App for GraphApp {
         });
 
         // Sidebar switchable between Tooling and Query console
-        if self.sidebar_open && self.sidebar_mode == SidebarMode::Tooling {
-            egui::SidePanel::left("tooling_sidebar")
+        if self.sidebar_open {
+            let panel_id = match self.sidebar_mode {
+                SidebarMode::Tooling => "tooling_sidebar",
+                SidebarMode::Query => "query_sidebar",
+            };
+            egui::SidePanel::left(panel_id)
                 .resizable(true)
-                .default_width(260.0)
+                .default_width(match self.sidebar_mode {
+                    SidebarMode::Tooling => 260.0,
+                    SidebarMode::Query => 300.0,
+                })
                 .show(ctx, |ui| {
-                    ui.heading("Tooling");
+                    ui.horizontal(|ui| {
+                        let tooling_sel = self.sidebar_mode == SidebarMode::Tooling;
+                        if ui.selectable_label(tooling_sel, "Tooling").clicked() {
+                            self.deselect_all();
+                            self.sidebar_mode = SidebarMode::Tooling;
+                        }
+                        let query_sel = self.sidebar_mode == SidebarMode::Query;
+                        if ui.selectable_label(query_sel, "Query").clicked() {
+                            self.deselect_all();
+                            self.multi_select_active = false;
+                            self.sidebar_mode = SidebarMode::Query;
+                        }
+                    });
                     ui.separator();
-                    // Make tooling usable on very small windows via scrolling
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
 
-                    // Layout tools
-                    egui::CollapsingHeader::new("Layout")
-                        .default_open(false)
-                        .show(ui, |ui| {
+                    match self.sidebar_mode {
+                        SidebarMode::Tooling => {
+                            ui.heading("Tooling");
+                            ui.add_space(4.0);
+                            // Make tooling usable on very small windows via scrolling
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                egui::CollapsingHeader::new("Layout")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
                         if ui.button("Auto-cluster layout").on_hover_text("Detect communities and arrange nodes").clicked() {
                             if let Some(r) = self.last_canvas_rect {
                                 self.apply_cluster_layout_all(r);
@@ -1175,16 +1784,20 @@ impl eframe::App for GraphApp {
                                         let kk = k.trim();
                                         if !kk.is_empty() { md.insert(kk.to_string(), v.trim().to_string()); }
                                     }
-                                    if let Some(rid) = self.db.add_relationship(from.unwrap(), to.unwrap(), label, md) {
-                                        self.selected = Some(SelectedItem::Rel(rid));
-                                        self.re_cluster_pending = true;
-                                        self.create_rel_label.clear();
-                                        self.create_rel_from = None;
-                                        self.create_rel_to = None;
-                                        self.create_rel_meta.clear();
-                                        self.mark_dirty();
+                                    if let (Some(from_id), Some(to_id)) = (from, to) {
+                                        if let Some(rid) = self.db.add_relationship(from_id, to_id, label, md) {
+                                            self.selected = Some(SelectedItem::Rel(rid));
+                                            self.re_cluster_pending = true;
+                                            self.create_rel_label.clear();
+                                            self.create_rel_from = None;
+                                            self.create_rel_to = None;
+                                            self.create_rel_meta.clear();
+                                            self.mark_dirty();
+                                        } else {
+                                            error_rel = Some("Failed to create relationship (nodes may not exist)".into());
+                                        }
                                     } else {
-                                        error_rel = Some("Failed to create relationship (nodes may not exist)".into());
+                                        error_rel = Some("Select both From and To nodes".into());
                                     }
                                 }
                             }
@@ -1257,30 +1870,25 @@ impl eframe::App for GraphApp {
                         self.multi_select_active = false;
                     }
                     });
-                });
-        }
-        if self.sidebar_open && self.sidebar_mode == SidebarMode::Query {
-            egui::SidePanel::left("query_sidebar")
-                .resizable(true)
-                .default_width(300.0)
-                .show(ctx, |ui| {
-                    ui.heading("Query Console");
-                    ui.separator();
-                    let was_compact = self.sidebar_compact;
-                    // Use compact styling if enabled
-                    ui.scope(|ui| {
-                        if was_compact {
-                            let mut style: egui::Style = (*ui.style()).as_ref().clone();
-                            style.spacing.item_spacing = egui::vec2(4.0, 4.0);
-                            style.spacing.button_padding = egui::vec2(6.0, 4.0);
-                            style.spacing.indent = 6.0;
-                            style.spacing.interact_size.y = 18.0;
-                            style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(12.0));
-                            style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(12.0));
-                            style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
-                            ui.set_style(style);
-                        }
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                }
+                SidebarMode::Query => {
+                            ui.heading("Query Console");
+                            ui.add_space(4.0);
+                            let was_compact = self.sidebar_compact;
+                            // Use compact styling if enabled
+                            ui.scope(|ui| {
+                                if was_compact {
+                                    let mut style: egui::Style = (*ui.style()).as_ref().clone();
+                                    style.spacing.item_spacing = egui::vec2(4.0, 4.0);
+                                    style.spacing.button_padding = egui::vec2(6.0, 4.0);
+                                    style.spacing.indent = 6.0;
+                                    style.spacing.interact_size.y = 18.0;
+                                    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(12.0));
+                                    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(12.0));
+                                    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+                                    ui.set_style(style);
+                                }
+                                egui::ScrollArea::vertical().show(ui, |ui| {
                             ui.label("Enter query (Cmd/Ctrl+Enter to run):");
                             let edit = egui::TextEdit::multiline(&mut self.query_text)
                                 .desired_rows(8)
@@ -1312,7 +1920,7 @@ impl eframe::App for GraphApp {
                             let accept_enter_early = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt);
                             let accept_tab_early = ui.input(|i| i.key_pressed(egui::Key::Tab));
 
-                            let mut consider_recompute = (te_resp.changed() && !(accept_enter_early || accept_tab_early)) || want_popup_all;
+                            let consider_recompute = (te_resp.changed() && !(accept_enter_early || accept_tab_early)) || want_popup_all;
                             // Only show suggestions when the text edit has focus
                             if !te_resp.has_focus() { self.query_suggest_visible = false; }
 
@@ -1337,7 +1945,7 @@ impl eframe::App for GraphApp {
                                     // Do not proceed with computing prefix/pool in this frame
                                 } else {
                                 let caret_at_end = true; // simplified: egui API for exact caret is elaborate; assume common case
-                                let (prefix, start_idx) = if caret_at_end {
+                                let (prefix, _start_idx) = if caret_at_end {
                                     // Trim trailing whitespace (e.g., Enter inserted a newline) before detecting token
                                     let mut end = text.len();
                                     while end > 0 {
@@ -1416,8 +2024,8 @@ impl eframe::App for GraphApp {
 
                             // Handle navigation/acceptance keys for suggestions
                             if self.query_suggest_visible && te_resp.has_focus() {
-                                let mut move_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
-                                let mut move_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                                let move_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                                let move_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
                                 // Reuse early-detected acceptance to ensure consistent behavior
                                 let accept_enter = accept_enter_early;
                                 let accept_tab = accept_tab_early;
@@ -1629,7 +2237,9 @@ impl eframe::App for GraphApp {
                                     let fmt = time::macros::format_description!("[year][month][day]_[hour][minute][second]");
                                     let stamp = now.format(&fmt).unwrap_or_else(|_| "now".into());
                                     let ext = if self.query_export_is_json { "json" } else { "csv" };
-                                    self.query_export_path = format!("assets/exports/query_export_{}.{}", stamp, ext);
+                                    let mut base = self.app_settings.export_dir();
+                                    base.push(format!("query_export_{}.{}", stamp, ext));
+                                    self.query_export_path = base.display().to_string();
                                 }
                                 ui.label("Save as:");
                                 ui.text_edit_singleline(&mut self.query_export_path);
@@ -1669,10 +2279,12 @@ impl eframe::App for GraphApp {
                                     self.query_text = h.clone();
                                 }
                             }
-                        });
-                    });
-                });
-        }
+                        }); // close Query ScrollArea
+                    }); // close Query scope
+                } // close SidebarMode::Query
+            } // close match self.sidebar_mode
+        }); // close SidePanel::show
+    } // close if self.sidebar_open
 
         // Confirmation modal for mass delete
         if self.confirm_mass_delete {
@@ -1731,10 +2343,10 @@ impl eframe::App for GraphApp {
             }
             self.ensure_layout(available);
 
-            // Panning with middle mouse or dragging background
+            // Panning with middle mouse or dragging background (disabled for left-drag when multi-select rectangle is active)
             let bg_resp = ui.allocate_rect(available, Sense::click_and_drag());
             if bg_resp.dragged_by(egui::PointerButton::Middle)
-                || (bg_resp.dragged() && self.dragging.is_none())
+                || (bg_resp.dragged() && self.dragging.is_none() && !self.multi_select_active)
             {
                 self.pan += bg_resp.drag_delta();
             }
@@ -1794,13 +2406,47 @@ impl eframe::App for GraphApp {
                 )
             };
 
+            // Rectangle (rubber-band) multi-select handling
+            if self.multi_select_active {
+                // Begin rectangle on left-button drag start over background
+                if bg_resp.drag_started() {
+                    if let Some(pos) = ui.input(|i| i.pointer.press_origin()) {
+                        self.rect_select_start = Some(pos);
+                        self.rect_select_current = Some(pos);
+                    }
+                }
+                // Update current corner while dragging
+                if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
+                    if self.rect_select_start.is_some() && bg_resp.dragged() {
+                        self.rect_select_current = Some(cur);
+                    }
+                }
+                // On release (primary button up), compute world-rect and add all nodes inside to multi selection
+                if self.rect_select_start.is_some() && !ui.input(|i| i.pointer.primary_down()) {
+                    if let (Some(a), Some(b)) = (self.rect_select_start.take(), self.rect_select_current.take()) {
+                        let aw = from_screen(a);
+                        let bw = from_screen(b);
+                        let sel_rect = Rect::from_two_pos(aw, bw);
+                        for (id, pos_w) in self.node_positions.iter() {
+                            if sel_rect.contains(*pos_w) {
+                                self.multi_selected_nodes.insert(*id);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Ensure rectangle state is cleared when not in multi-select mode
+                self.rect_select_start = None;
+                self.rect_select_current = None;
+            }
+
             // Determine hover before drawing for highlighting/dimming
             // Compute hover over nearest node within radius in screen space
             let mut hover_node: Option<NodeId> = None;
             if let Some(mouse_pos) = ui.ctx().pointer_hover_pos() {
                 let node_radius = 10.0 * self.zoom;
                 let mut best_d2 = f32::INFINITY;
-                for (id, _node) in &self.db.nodes {
+                for id in self.db.nodes.keys() {
                     if let Some(pw) = self.node_positions.get(id) {
                         let ps = to_screen(*pw);
                         let dx = ps.x - mouse_pos.x; let dy = ps.y - mouse_pos.y;
@@ -1891,7 +2537,7 @@ impl eframe::App for GraphApp {
                         } else {
                             Color32::from_rgba_premultiplied(245, 245, 245, self.edge_label_bg_alpha)
                         };
-                        let outline = Color32::from_rgba_premultiplied(0, 0, 0, 120);
+                        let _outline = Color32::from_rgba_premultiplied(0, 0, 0, 120);
 
                         // Layout the text to size the pill
                         let galley = ui.painter().layout_no_wrap(rel.label.clone(), font.clone(), txt_color);
@@ -2100,7 +2746,7 @@ impl eframe::App for GraphApp {
             if !self.multi_select_active && clicked_node.is_none() && !any_node_dragged && bg_resp.clicked() {
                 if let Some(pointer_pos) = ui.input(|i| i.pointer.latest_pos()) {
                     // Helper: compute the same curved polyline used for drawing
-                    let compute_edge_points = |a: Pos2, b: Pos2, rel_id: Uuid, from_id: NodeId, to_id: NodeId| -> (Pos2, Pos2, Pos2) {
+                    let compute_edge_points = |a: Pos2, b: Pos2, _rel_id: Uuid, from_id: NodeId, to_id: NodeId| -> (Pos2, Pos2, Pos2) {
                         let dir = Vec2::new(b.x - a.x, b.y - a.y);
                         let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
                         if len > 1.0 {
@@ -2165,6 +2811,15 @@ impl eframe::App for GraphApp {
                 }
             }
 
+            // Draw rectangle overlay last so it appears above nodes/edges
+            if let (Some(a), Some(b)) = (self.rect_select_start, self.rect_select_current) {
+                let rect = Rect::from_two_pos(a, b);
+                let fill = Color32::from_rgba_premultiplied(100, 150, 255, 40);
+                let stroke = Stroke::new(1.0, Color32::from_rgba_premultiplied(100, 150, 255, 160));
+                painter.rect_filled(rect, 0.0, fill);
+                painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+            }
+
             // Smooth convergence using a simple spring-damper integration.
             // Neo4j-style aids for large graphs: center gravity and degree-aware repulsion.
             let active = match self.converge_start { Some(t0) => t0.elapsed() < Duration::from_secs(5), None => false };
@@ -2188,11 +2843,44 @@ impl eframe::App for GraphApp {
                     self.node_velocities.entry(id).or_insert(Vec2::ZERO);
                 }
 
+                // Pre-calculate dragged unit if we are in a multiselect drag
+                let mut dragged_unit: HashSet<NodeId> = HashSet::new();
+                if let Some(drag_id) = self.dragging {
+                    if self.multi_selected_nodes.contains(&drag_id) && !self.multi_selected_nodes.is_empty() {
+                        dragged_unit.extend(self.multi_selected_nodes.iter().copied());
+                        let mut stack: Vec<NodeId> = self.multi_selected_nodes.iter().copied().collect();
+                        while let Some(curr) = stack.pop() {
+                            for rel in self.db.relationships.values() {
+                                if rel.from_node == curr {
+                                    if dragged_unit.insert(rel.to_node) {
+                                        stack.push(rel.to_node);
+                                    }
+                                } else if rel.to_node == curr {
+                                    if dragged_unit.insert(rel.from_node) {
+                                        stack.push(rel.from_node);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        dragged_unit.insert(drag_id);
+                    }
+                }
+
                 // Accumulate forces
                 let mut forces: HashMap<NodeId, Vec2> = HashMap::new();
                 // Relationship springs (bidirectional: attract if stretched, repel if compressed)
                 for rel in self.db.relationships.values() {
                     let (a_id, b_id) = (rel.from_node, rel.to_node);
+                    
+                    // If we are dragging a multi-selection, and either node is part of the unit,
+                    // we "lock out" the physics for these nodes to prevent them from being pulled back.
+                    if !dragged_unit.is_empty() && self.dragging.is_some() && !self.multi_selected_nodes.is_empty() {
+                        if dragged_unit.contains(&a_id) || dragged_unit.contains(&b_id) {
+                            continue;
+                        }
+                    }
+
                     let (pa_opt, pb_opt) = (self.node_positions.get(&a_id).copied(), self.node_positions.get(&b_id).copied());
                     if let (Some(pa), Some(pb)) = (pa_opt, pb_opt) {
                         let dx = pb.x - pa.x;
@@ -2217,6 +2905,14 @@ impl eframe::App for GraphApp {
                     // Iterate over a snapshot to avoid borrow conflicts
                     let snapshot: Vec<(NodeId, Pos2)> = self.node_positions.iter().map(|(k,v)| (*k, *v)).collect();
                     for (id, pos) in snapshot.iter() {
+                        // If we are dragging a multi-selection, and this node is part of the unit,
+                        // we lock out gravity.
+                        if !dragged_unit.is_empty() && self.dragging.is_some() && !self.multi_selected_nodes.is_empty() {
+                            if dragged_unit.contains(id) {
+                                continue;
+                            }
+                        }
+
                         // Compute local COM of neighbors within radius (excluding self)
                         let mut sum_x = 0.0f32;
                         let mut sum_y = 0.0f32;
@@ -2252,6 +2948,15 @@ impl eframe::App for GraphApp {
                     for j in (i + 1)..ids.len() {
                         let a = ids[i];
                         let b = ids[j];
+
+                        // If we are dragging a multi-selection, and either node is part of the unit,
+                        // we lock out repulsion for these nodes.
+                        if !dragged_unit.is_empty() && self.dragging.is_some() && !self.multi_selected_nodes.is_empty() {
+                            if dragged_unit.contains(&a) || dragged_unit.contains(&b) {
+                                continue;
+                            }
+                        }
+
                         let (pa_opt, pb_opt) = (self.node_positions.get(&a).copied(), self.node_positions.get(&b).copied());
                         let (pa, pb) = match (pa_opt, pb_opt) { (Some(pa), Some(pb)) => (pa, pb), _ => continue };
                         let dx = pb.x - pa.x;
@@ -2276,12 +2981,17 @@ impl eframe::App for GraphApp {
                 }
 
                 // Soft drag: apply a spring pulling the dragged node towards the mouse in world space
+                // If multiple nodes are selected, dragging one drags them all together by applying
+                // the same translation force vector to each selected node.
                 if let Some(drag_id) = self.dragging {
                     if let Some(mouse_pos_screen) = ui.input(|i| i.pointer.latest_pos()) {
                         let mouse_world = from_screen(mouse_pos_screen);
-                        if let Some(p) = self.node_positions.get(&drag_id).copied() {
-                            let dir = Vec2::new(mouse_world.x - p.x, mouse_world.y - p.y);
-                            *forces.entry(drag_id).or_insert(Vec2::ZERO) += dir * mouse_k;
+                        if let Some(p_drag) = self.node_positions.get(&drag_id).copied() {
+                            let dir = Vec2::new(mouse_world.x - p_drag.x, mouse_world.y - p_drag.y);
+                            // Apply force to all nodes in the unit
+                            for nid in &dragged_unit {
+                                *forces.entry(*nid).or_insert(Vec2::ZERO) += dir * mouse_k;
+                            }
                         }
                     }
                 }
@@ -2643,7 +3353,7 @@ fn point_segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 }
 
 // UI helpers
-fn short_uuid(id: Uuid) -> String {
+fn _short_uuid(id: Uuid) -> String {
     let s = id.as_simple().to_string();
     s.chars().rev().take(8).collect::<Vec<char>>().into_iter().rev().collect()
 }

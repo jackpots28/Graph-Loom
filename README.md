@@ -45,8 +45,68 @@ Graph-Loom is a lightweight, local-first graph notebook and visualizer built wit
 
 - Query logging
   - Executed queries are logged to assets/logs/queries_YYYYMMDD.log with basic status info.
-
+  
   ![Cypher MATCH example](assets/graph_loom_cypher_match_snippet.png)
+
+- Rectangle multi-selection (Bulk Edit)
+  - In Tooling → Bulk Edit Nodes, click “Start Selecting” and drag a rectangle on the canvas to select many nodes at once. Toggle nodes by clicking while in this mode. Use the Bulk Edit actions to upsert/delete metadata or delete selected nodes.
+
+### Embedded API Service (optional)
+
+Graph-Loom can expose a lightweight HTTP/WebSocket API for remote interaction, similar to a database REPL.
+
+- Enabling: open Settings → Preferences… → "API Service (Actix)" and toggle "Enable API Server". Configure bind address, port, and an optional API key.
+- Default bind: 127.0.0.1:8787
+- Authentication: if an API key is configured, include header `X-API-Key: <your key>` with requests.
+- Endpoints:
+  - POST /api/query
+    - Body (JSON): `{ "query": "...", "params": {"k":"v"}, "log": true }`
+    - Returns: JSON with rows and counts reflecting the same outcome the in-app console produces.
+    - Example using jq to format the results:
+```bash
+  curl -X POST http://127.0.0.1:8787/api/query \                                                                                                                                    took  12s at  12:59:06
+       -H 'Content-Type: application/json' \
+       -d '{"query":"MATCH (n) RETURN n LIMIT 5"}' | jq '.'
+```
+  - GET /api/repl (WebSocket)
+    - After connect, send text messages where each message is a query; responses are JSON results per message.
+
+Note: The API feature is enabled by default in builds of the app and controlled at runtime via Preferences. On first enable, the server starts within the running app; changes to bind/port require the server to restart (the app does this automatically on Save).
+
+#### API traffic logging
+- All API traffic (HTTP and WebSocket) is logged to daily files under a configurable directory.
+- Default directory: {OS temp}/Graph-Loom/api-logs (e.g., /tmp/Graph-Loom/api-logs on Unix/macOS).
+- Configure in Settings → Preferences → "API Service (Actix)" → "API log directory". Leave empty to use defaults.
+- Log format (one line per event): `YYYY-MM-DD HH:MM:SS | <event>` where events include server start, HTTP requests and results, WebSocket connects/queries/results, timeouts, and errors.
+
+### CLI client (optional): glsh
+
+Graph-Loom includes an optional command-line client glsh (Graph-Loom Shell) to connect to the API WebSocket REPL.
+
+- Build: `cargo build --features cli --bin glsh`
+- Connect: `target/debug/glsh --host 127.0.0.1 --port 8787`
+- With API key: `target/debug/glsh --host 127.0.0.1 --port 8787 --api-key <KEY>`
+- One-off evaluation: `glsh -e "MATCH (n) RETURN n LIMIT 2"`
+- Example output (truncated):
+```text
+  Connected to ws://127.0.0.1:8787/api/repl.
+  Type queries and press Enter. Commands: :help, :quit. History saved at /Users/simsjo/Library/Application Support/Graph-Loom/glsh_history.txt.
+  
+  glsh> MATCH (n) RETURN n LIMIT 5;
+  {
+    "affected_nodes": 0,
+    "affected_relationships": 0,
+    "mutated": false,
+    "rows": [
+      {
+        "id": "019bfb2b-d43e-76b0-87c2-1ddd60935f9c",
+        "kind": "node",
+        "label": "test",
+        "metadata": {}
+      }
+      ...
+```
+- Interactive mode supports line editing and history (stored under the app’s settings directory).
 
 ---
 
@@ -86,6 +146,15 @@ On first launch, if assets/state.ron is missing, you’ll start with an empty gr
   - Drag nodes directly; neighbors will adjust smoothly. Motion stops after 3s unless you drag again or re-layout.
 
   ![Tooling and layout controls](assets/graph_loom_tooling_dropdowns_snippet.png)
+
+- Exporting
+  - Export query matches or the entire graph as JSON or CSV from the Sidebar (Query → Export Matches) or File → Export Graph…
+  - The default export directory is configurable in Preferences (App Settings). If unset, it falls back to the OS temp directory (e.g., /tmp/Graph-Loom/exports).
+
+- Preferences
+  - Split into two tabs: App Settings and API Settings.
+  - App Settings: autosave directory, export directory, and LOD controls. Shows the settings save directory.
+  - API Settings: enable/disable API server, bind, port, API key, and API log directory (defaulting to OS temp). Changes are applied on Save; the server restarts automatically.
 
 - Bulk edit
   - Sidebar → Bulk Edit Nodes for batch label/metadata operations, where available.

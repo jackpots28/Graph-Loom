@@ -51,7 +51,7 @@ fn log_query(query: &str, outcome: &Result<QueryOutcome>) {
     }
 }
 
-fn split_statements(input: &str) -> Vec<String> {
+fn _split_statements(input: &str) -> Vec<String> {
     // Primary split by ';'. Additionally, split when a new line starts with a Cypher keyword (CREATE/MATCH/OPTIONAL MATCH/MERGE/RETURN/DELETE/DETACH DELETE)
     // This allows multi-line separate statements without semicolons, while preserving multi-line bodies like CREATE with patterns on following lines.
     let mut parts: Vec<String> = Vec::new();
@@ -142,6 +142,8 @@ pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome
     Ok(outcome)
 }
 
+// Only used by tests; silence dead_code in normal builds while keeping it available to tests
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn execute_and_log(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome> {
     let res = execute_query(db, query);
     log_query(query, &res);
@@ -152,6 +154,8 @@ pub fn execute_and_log(db: &mut GraphDatabase, query: &str) -> Result<QueryOutco
 /// This preserves legacy command compatibility and routes true Cypher statements to the
 /// parameter-aware engine. Parameters are simple string map values; numbers should be
 /// provided as strings and will be compared numerically where supported by the engine.
+// Public entry point primarily for tests; keep available but avoid unused warnings in normal builds
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn execute_query_with_params(
     db: &mut GraphDatabase,
     query: &str,
@@ -210,7 +214,9 @@ pub fn execute_query_with_params(
 }
 
 /// Same as execute_and_log but accepts parameters for OpenCypher `$param`s.
-pub fn execute_and_log_with_params(
+// Private helper for tests; suppress dead_code outside of test builds
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn _execute_and_log_with_params(
     db: &mut GraphDatabase,
     query: &str,
     params: &HashMap<String, String>,
@@ -392,14 +398,11 @@ fn exec_cypher_match_merge(db: &mut GraphDatabase, stmt: &str) -> Result<(Vec<Qu
         let p = p.trim();
         if !p.starts_with('(') || !p.ends_with(')') { return Err(anyhow!("invalid node pattern: {}", p)); }
         let inside = &p[1..p.len()-1];
-        let mut var = String::new();
-        let mut label = String::new();
-        if let Some(col) = inside.find(':') {
-            var = inside[..col].trim().to_string();
-            label = inside[col+1..].trim().to_string();
+        let (var, label) = if let Some(col) = inside.find(':') {
+            (inside[..col].trim().to_string(), inside[col+1..].trim().to_string())
         } else {
-            var = inside.trim().to_string();
-        }
+            (inside.trim().to_string(), String::new())
+        };
         if var.is_empty() { return Err(anyhow!("variable name required in node pattern")); }
         Ok((var, label))
     }
@@ -420,12 +423,12 @@ fn exec_cypher_match_merge(db: &mut GraphDatabase, stmt: &str) -> Result<(Vec<Qu
         // Normalize spaces and case a bit; expect pattern like: id(a) < id(b)
         let wu = w.replace(" ", "");
         // Identify operator by precedence
-        let (op, sym) = if let Some(i) = wu.find("<=") { (CmpOp::Lte, "<=") }
-            else if let Some(i) = wu.find(">=") { (CmpOp::Gte, ">=") }
-            else if let Some(i) = wu.find("<>") { (CmpOp::Ne, "<>") }
-            else if let Some(i) = wu.find('<') { (CmpOp::Lt, "<") }
-            else if let Some(i) = wu.find('>') { (CmpOp::Gt, ">") }
-            else if let Some(i) = wu.find('=') { (CmpOp::Eq, "=") }
+        let (op, sym) = if let Some(_i) = wu.find("<=") { (CmpOp::Lte, "<=") }
+            else if let Some(_i) = wu.find(">=") { (CmpOp::Gte, ">=") }
+            else if let Some(_i) = wu.find("<>") { (CmpOp::Ne, "<>") }
+            else if let Some(_i) = wu.find('<') { (CmpOp::Lt, "<") }
+            else if let Some(_i) = wu.find('>') { (CmpOp::Gt, ">") }
+            else if let Some(_i) = wu.find('=') { (CmpOp::Eq, "=") }
             else { return Err(anyhow!("unsupported WHERE comparator; use <,>,<=,>=,=,<>")); };
         let parts: Vec<&str> = wu.split(sym).collect();
         if parts.len() != 2 { return Err(anyhow!("malformed WHERE clause")); }
