@@ -345,7 +345,7 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
         let mut deferred_set: Option<Vec<String>> = None;
         let mut deferred_remove: Option<Vec<String>> = None;
         let rest_up = rest.to_uppercase();
-        let (mut patterns_str, mut tail) = if let Some(i) = find_keyword_boundary(&rest_up, "RETURN") {
+        let (mut patterns_str, tail) = if let Some(i) = find_keyword_boundary(&rest_up, "RETURN") {
             // There is a RETURN later; but there may also be WHERE/SET/REMOVE before it.
             let head = &rest[..i];
             let head_up = head.to_uppercase();
@@ -485,7 +485,7 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
                     distinct = true;
                     body = body[9..].trim();
                 }
-                let body_up = body.to_uppercase();
+                let _body_up = body.to_uppercase();
                 // Extract LIMIT and SKIP from the end if present (order-insensitive between them)
                 let mut limit: Option<usize> = None;
                 let mut skip: Option<usize> = None;
@@ -495,7 +495,7 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
                     let up = working.to_uppercase();
                     if let Some(idx) = up.rfind(" LIMIT ") {
                         let tail = working[idx+7..].trim();
-                        if let Some(space) = tail.find(' ') { /* keep only last segment */ }
+                        if let Some(_space) = tail.find(' ') { /* keep only last segment */ }
                         if let Ok(n) = tail.parse::<usize>() { limit = Some(n); working = working[..idx].trim_end().to_string(); continue; }
                     }
                     if let Some(idx) = up.rfind(" SKIP ") {
@@ -641,14 +641,17 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
         // Support CREATE followed by any whitespace/newlines before patterns
         let body = &q[6..].trim();
         let mut parts = body.splitn(2, " RETURN ");
-        let pats = parts.next().unwrap();
+        let pats = match parts.next() {
+            Some(s) => s,
+            None => return Err(anyhow!("missing CREATE patterns")),
+        };
         let mut patterns = Vec::new();
         for pat in split_top_level_comma(pats) { if !pat.is_empty() { patterns.push(parse_pattern(&pat)?); } }
         clauses.push(Clause::Create { patterns });
         if let Some(ret) = parts.next() {
             // Allow ORDER BY/LIMIT/SKIP after RETURN even in CREATE ... RETURN
             let ret_trim = ret.trim();
-            let mut body = ret_trim;
+            let body = ret_trim;
             let mut limit: Option<usize> = None;
             let mut skip: Option<usize> = None;
             let mut working = body.to_string();
@@ -682,7 +685,7 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
     } else if up.starts_with("WITH ") {
         // Standalone WITH at statement start
         // Parse WITH ... [ORDER BY ...] [SKIP n] [LIMIT n]
-        let mut body = &q[5..].trim();
+        let body = &q[5..].trim();
         // No trailing RETURN handled here (next statement may contain it)
         let mut limit: Option<usize> = None;
         let mut skip: Option<usize> = None;
@@ -889,8 +892,10 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
                                             if r.metadata.get(k) != Some(&v) { ok_rel_props = false; break; }
                                         }
                                         if !ok_rel_props { continue; }
-                                        let from = db.nodes.get(&r.from_node).unwrap();
-                                        let to = db.nodes.get(&r.to_node).unwrap();
+                                        let (Some(from), Some(to)) = (
+                                            db.nodes.get(&r.from_node),
+                                            db.nodes.get(&r.to_node),
+                                        ) else { continue; };
 
                                         // Helper to try match given (L,R) node order
                                         let try_match = |left_np: &NodePattern, right_np: &NodePattern, a: &Node, b: &Node| -> bool {
@@ -1141,7 +1146,7 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
             Clause::With { items, distinct: _distinct, order_by, skip, limit } => {
                 // Project rows to only listed items (variables supported), then apply ORDER BY/SKIP/LIMIT
                 // Build sort keys per original rows, then project
-                let single_item = items.len() == 1; // impacts how we interpret pagination
+                let _single_item = items.len() == 1; // impacts how we interpret pagination
                 // Evaluate keys for ordering
                 let mut keyed_rows: Vec<(Vec<String>, HashMap<String, Val>)> = Vec::new();
                 for r in &rows {
@@ -1364,7 +1369,13 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
                         let rid = if let Some(rid) = rid_opt { rid } else {
                             let mut meta = HashMap::new();
                             for (k, vraw) in &rel.props { meta.insert(k.clone(), resolve_param(vraw, params)?); }
-                            db.add_relationship(from_id, to_id, typ.clone(), meta).unwrap()
+                            match db.add_relationship(from_id, to_id, typ.clone(), meta) {
+                                Some(r) => r,
+                                None => {
+                                    // If either endpoint is missing (unexpected), skip creating this rel to avoid panic.
+                                    continue;
+                                }
+                            }
                         };
                         let mut m = row.clone();
                         if let Some(rv) = &rel.var { m.insert(rv.clone(), Val::RelId(rid)); }
