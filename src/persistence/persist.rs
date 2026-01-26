@@ -9,6 +9,7 @@ use time::macros::format_description;
 use time::OffsetDateTime;
 
 use crate::graph_utils::graph::{GraphDatabase, NodeId};
+use super::settings::AppSettings;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppStateFile {
@@ -33,6 +34,11 @@ impl AppStateFile {
         }
     }
 
+    /// Convert a persisted AppStateFile into runtime structures.
+    ///
+    /// This intentionally consumes `self` to avoid cloning large buffers.
+    /// Keeping the existing API preserves behavior; allow clippy's naming lint.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_runtime(self) -> (GraphDatabase, HashMap<NodeId, egui::Pos2>, egui::Vec2, f32) {
         let positions: HashMap<NodeId, egui::Pos2> = self
             .node_positions
@@ -44,23 +50,37 @@ impl AppStateFile {
     }
 }
 
-pub fn assets_dir() -> PathBuf {
-    PathBuf::from("assets")
+use std::sync::OnceLock;
+
+static SETTINGS_OVERRIDE: OnceLock<AppSettings> = OnceLock::new();
+
+pub fn set_settings_override(settings: AppSettings) {
+    let _ = SETTINGS_OVERRIDE.set(settings);
+}
+
+fn autosave_dir() -> PathBuf {
+    // If an override is set (e.g. from main.rs), use it.
+    if let Some(settings) = SETTINGS_OVERRIDE.get() {
+        return settings.autosave_dir();
+    }
+    // Load settings if present; else use defaults
+    let settings = AppSettings::load().unwrap_or_default();
+    settings.autosave_dir()
 }
 
 pub fn active_state_path() -> PathBuf {
-    assets_dir().join("state.ron")
+    autosave_dir().join("state.ron")
 }
 
 pub fn versioned_state_path_now() -> PathBuf {
     let now = OffsetDateTime::now_utc();
     let fmt = format_description!("[year][month][day]_[hour][minute][second]");
     let stamp = now.format(fmt).unwrap_or_else(|_| "unknown".to_string());
-    assets_dir().join(format!("state_{}.ron", stamp))
+    autosave_dir().join(format!("state_{}.ron", stamp))
 }
 
-fn ensure_assets_dir() -> std::io::Result<()> {
-    fs::create_dir_all(assets_dir())
+fn ensure_autosave_dir() -> std::io::Result<()> {
+    fs::create_dir_all(autosave_dir())
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -75,7 +95,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 pub fn save_active(state: &AppStateFile) -> anyhow::Result<PathBuf> {
-    ensure_assets_dir()?;
+    ensure_autosave_dir()?;
     let pretty = PrettyConfig::new()
         .separate_tuple_members(true)
         .enumerate_arrays(true);
@@ -86,7 +106,7 @@ pub fn save_active(state: &AppStateFile) -> anyhow::Result<PathBuf> {
 }
 
 pub fn save_versioned(state: &AppStateFile) -> anyhow::Result<PathBuf> {
-    ensure_assets_dir()?;
+    ensure_autosave_dir()?;
     let pretty = PrettyConfig::new()
         .separate_tuple_members(true)
         .enumerate_arrays(true);
@@ -113,15 +133,15 @@ pub fn load_from_path(path: &Path) -> anyhow::Result<AppStateFile> {
 }
 
 pub fn list_versions() -> anyhow::Result<Vec<PathBuf>> {
-    let dir = assets_dir();
+    let dir = autosave_dir();
     let mut entries: Vec<PathBuf> = Vec::new();
     if dir.exists() {
         for e in fs::read_dir(dir)? {
             let p = e?.path();
-            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                if name.starts_with("state_") && name.ends_with(".ron") {
-                    entries.push(p);
-                }
+            if let Some(name) = p.file_name().and_then(|s| s.to_str())
+                && name.starts_with("state_") && name.ends_with(".ron")
+            {
+                entries.push(p);
             }
         }
     }
