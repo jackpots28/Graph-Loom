@@ -64,7 +64,7 @@ Graph-Loom can expose a lightweight HTTP/WebSocket API for remote interaction, s
     - Returns: JSON with rows and counts reflecting the same outcome the in-app console produces.
     - Example using jq to format the results:
 ```bash
-  curl -X POST http://127.0.0.1:8787/api/query \                                                                                                                                    took  12s at  12:59:06
+  curl -X POST http://127.0.0.1:8787/api/query \
        -H 'Content-Type: application/json' \
        -d '{"query":"MATCH (n) RETURN n LIMIT 5"}' | jq '.'
 ```
