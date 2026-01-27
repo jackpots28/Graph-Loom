@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 mod gql;
 mod graph_utils;
 mod gui;
