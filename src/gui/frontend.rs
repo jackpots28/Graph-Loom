@@ -1102,6 +1102,14 @@ impl eframe::App for GraphApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 // Also request attention when showing from internal state change
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+                // Briefly set AlwaysOnTop here too to be safe
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+                let ctx_clone = ctx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
+                });
             }
             LAST_SHOW_WINDOW.store(show_window, std::sync::atomic::Ordering::SeqCst);
         }

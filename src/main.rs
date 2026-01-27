@@ -177,12 +177,16 @@ fn main() -> eframe::Result {
                             let ctx_clone = ctx.clone();
                             std::thread::spawn(move || {
                                 // Assert focus and level multiple times over a short period
-                                for i in 1..=5 {
-                                    std::thread::sleep(std::time::Duration::from_millis(100 * i));
+                                // Increasing attempts and duration for better reliability on Windows
+                                for i in 1..=10 {
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                                     ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
                                     if i == 5 {
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                                     }
+                                    ctx_clone.request_repaint();
                                 }
                             });
                         } else if event.id == quit_item_id {
