@@ -9,7 +9,6 @@ static API_REQ_TX: OnceCell<Sender<ApiRequest>> = OnceCell::new();
 
 #[derive(Debug, Clone)]
 pub struct ApiRequest {
-    pub api_key: Option<String>,
     pub request_id: String,
     pub query: String,
     pub params: Option<HashMap<String, String>>, // optional
@@ -35,6 +34,8 @@ pub fn init_broker() -> Receiver<ApiRequest> {
 // Server lifecycle API (feature-gated). Non-API builds get no-op stubs.
 #[cfg(feature = "api")]
 pub mod server;
+#[cfg(feature = "api")]
+pub mod grpc;
 
 #[cfg(not(feature = "api"))]
 pub mod server {
@@ -43,4 +44,11 @@ pub mod server {
     pub fn start_server(_cfg: &AppSettings) -> anyhow::Result<()> { Ok(()) }
     pub fn stop_server() {}
     pub fn is_running() -> bool { false }
+}
+
+#[cfg(not(feature = "api"))]
+pub mod grpc {
+    use crate::persistence::settings::AppSettings;
+    pub fn start_grpc_server(_cfg: &AppSettings) -> anyhow::Result<()> { Ok(()) }
+    pub fn stop_grpc_server() {}
 }
