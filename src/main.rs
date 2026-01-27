@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod gql;
 mod graph_utils;
 mod gui;
@@ -89,6 +89,10 @@ fn main() -> eframe::Result {
     #[cfg(not(feature = "api"))]
     crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
 
+    // Ensure LAST_SHOW_WINDOW matches initial state
+    // We can't easily access LAST_SHOW_WINDOW from here as it is inside GraphApp::update,
+    // but its default is true, so it will trigger if we start false.
+
     let icon_bytes = include_bytes!("../assets/AppSet.iconset/icon_512x512.png");
     let icon = match eframe::icon_data::from_png_bytes(icon_bytes) {
         Ok(i) => i,
@@ -157,6 +161,8 @@ fn main() -> eframe::Result {
                             crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            // Also request attention to really bring it to the foreground on Windows
+                            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                             ctx.request_repaint();
                         } else if event.id == quit_item_id {
                             std::process::exit(0);

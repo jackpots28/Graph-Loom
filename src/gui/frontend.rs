@@ -1094,7 +1094,14 @@ impl eframe::App for GraphApp {
 
         // Handle window visibility and background mode
         let show_window = crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show_window));
+        static LAST_SHOW_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if show_window != LAST_SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show_window));
+            if show_window {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            LAST_SHOW_WINDOW.store(show_window, std::sync::atomic::Ordering::SeqCst);
+        }
 
     // Process pending API requests (execute queries on the GUI thread safely)
     if let Some(rx) = &self.api_rx {
