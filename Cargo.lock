@@ -2308,6 +2308,7 @@ dependencies = [
  "tungstenite",
  "url",
  "uuid",
+ "windows 0.58.0",
 ]
 
 [[package]]

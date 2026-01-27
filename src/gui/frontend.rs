@@ -1105,18 +1105,26 @@ impl eframe::App for GraphApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                 // Briefly set AlwaysOnTop here too to be safe
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+
+                // Use Win32 API to force foreground on Windows
+                crate::gui::win_utils::force_foreground_window();
+
                 let ctx_clone = ctx.clone();
                 std::thread::spawn(move || {
-                    for i in 1..=30 {
+                    for i in 1..=20 {
                         std::thread::sleep(std::time::Duration::from_millis(150));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        
+                        // Use Win32 API to force foreground on Windows
+                        crate::gui::win_utils::force_foreground_window();
+
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        if i % 5 == 0 {
+                        if i % 10 == 0 {
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                         }
-                        if i == 20 {
+                        if i == 15 {
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                         }
                         ctx_clone.request_repaint();
