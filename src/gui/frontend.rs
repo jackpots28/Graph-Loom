@@ -1100,6 +1100,8 @@ impl eframe::App for GraphApp {
             if show_window {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                // Also request attention when showing from internal state change
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
             }
             LAST_SHOW_WINDOW.store(show_window, std::sync::atomic::Ordering::SeqCst);
         }
