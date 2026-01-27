@@ -30,7 +30,7 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
         
         // If we haven't found any window yet, take this one.
         // If we have, but this one has WS_VISIBLE (or was intended to be), prefer it.
-        if data.window_handle.is_none() || (style & WS_VISIBLE != 0) {
+        if data.window_handle.is_none() || (style & WS_VISIBLE.0 != 0) {
             data.window_handle = Some(hwnd);
         }
         
