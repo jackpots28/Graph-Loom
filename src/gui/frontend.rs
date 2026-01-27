@@ -1106,9 +1106,19 @@ impl eframe::App for GraphApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                 let ctx_clone = ctx.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
-                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    for i in 1..=20 {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        if i % 5 == 0 {
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+                        }
+                        if i == 10 {
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+                        }
+                        ctx_clone.request_repaint();
+                    }
                 });
             }
             LAST_SHOW_WINDOW.store(show_window, std::sync::atomic::Ordering::SeqCst);
