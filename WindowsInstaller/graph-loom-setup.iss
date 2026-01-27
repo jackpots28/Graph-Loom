@@ -40,7 +40,7 @@ Name: "quicklaunchicon"; Description: "{cm:CreateQuickLaunchIcon}"; GroupDescrip
 
 [Files]
 ; Main executable - adjust the source path to match your Rust build output
-Source: "..\target\release-lto\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; Include any additional DLLs or dependencies your Rust app needs
 ; Source: "..\target\release\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; Include assets directory if needed

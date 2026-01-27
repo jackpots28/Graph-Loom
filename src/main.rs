@@ -160,10 +160,20 @@ fn main() -> eframe::Result {
                         if event.id == show_item_id {
                             crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            // Set AlwaysOnTop briefly to force foreground on Windows
+                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                             // Also request attention to really bring it to the foreground on Windows
                             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                             ctx.request_repaint();
+                            
+                            // Use a small delay to reset window level so it doesn't stay on top
+                            let ctx_clone = ctx.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+                            });
                         } else if event.id == quit_item_id {
                             std::process::exit(0);
                         }

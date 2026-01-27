@@ -1098,6 +1098,7 @@ impl eframe::App for GraphApp {
         if show_window != LAST_SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show_window));
             if show_window {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             LAST_SHOW_WINDOW.store(show_window, std::sync::atomic::Ordering::SeqCst);
