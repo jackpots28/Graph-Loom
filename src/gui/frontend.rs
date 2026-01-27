@@ -1096,8 +1096,9 @@ impl eframe::App for GraphApp {
         let show_window = crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
         static LAST_SHOW_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
         if show_window != LAST_SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show_window));
             if show_window {
+                // RESTORING from background
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 // Also request attention when showing from internal state change
@@ -1106,20 +1107,30 @@ impl eframe::App for GraphApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                 let ctx_clone = ctx.clone();
                 std::thread::spawn(move || {
-                    for i in 1..=20 {
+                    for i in 1..=30 {
                         std::thread::sleep(std::time::Duration::from_millis(150));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
                         if i % 5 == 0 {
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                         }
-                        if i == 10 {
+                        if i == 20 {
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                         }
                         ctx_clone.request_repaint();
                     }
                 });
+            } else {
+                // GOING to background
+                // On Windows, if we want the app icon to STAY in the taskbar but the window to be hidden,
+                // Minimized(true) is often better than Visible(false).
+                // However, the user said "The app icon on the taskbar also does not return as it should",
+                // implying it DOES leave the taskbar (which is what we want for "background mode").
+                // If we use Visible(false), it leaves the taskbar. 
+                // To make it come back, we MUST use Visible(true).
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
             LAST_SHOW_WINDOW.store(show_window, std::sync::atomic::Ordering::SeqCst);
         }

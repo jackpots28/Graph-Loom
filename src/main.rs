@@ -179,7 +179,7 @@ fn main() -> eframe::Result {
                             std::thread::spawn(move || {
                                 // Assert focus and level multiple times over a short period
                                 // Increasing attempts and duration for better reliability on Windows
-                                for i in 1..=30 {
+                                for i in 1..=40 {
                                     std::thread::sleep(std::time::Duration::from_millis(150));
                                     
                                     // Continually re-assert visibility and non-minimized state
@@ -195,7 +195,7 @@ fn main() -> eframe::Result {
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                                     }
                                     
-                                    if i == 20 {
+                                    if i == 30 {
                                         // Return to normal level but continue asserting focus
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                                     }
