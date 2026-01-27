@@ -165,12 +165,6 @@ fn main() -> eframe::Result {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                             
-                            // Set AlwaysOnTop briefly to force foreground on Windows
-                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-                            
-                            // Also request attention to really bring it to the foreground on Windows
-                            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
-                            
                             // Use Win32 API to force foreground on Windows
                             crate::gui::win_utils::force_foreground_window();
 
@@ -182,8 +176,8 @@ fn main() -> eframe::Result {
                             std::thread::spawn(move || {
                                 // Assert focus and level multiple times over a short period
                                 // Increasing attempts and duration for better reliability on Windows
-                                for i in 1..=20 {
-                                    std::thread::sleep(std::time::Duration::from_millis(150));
+                                for i in 1..=10 {
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
                                     
                                     // Continually re-assert visibility and non-minimized state
                                     ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -195,14 +189,14 @@ fn main() -> eframe::Result {
                                     // Multi-pronged focus assertion
                                     ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
                                     
-                                    if i % 10 == 0 {
+                                    if i % 4 == 0 {
                                         // Pulse AlwaysOnTop and RequestAttention to break through OS focus prevention
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                                     }
                                     
-                                    if i == 15 {
-                                        // Return to normal level but continue asserting focus
+                                    if i == 8 {
+                                        // Return to normal level
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                                     }
                                     

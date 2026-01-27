@@ -2,8 +2,9 @@
 use windows::Win32::Foundation::{HWND, LPARAM, BOOL};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, 
+    EnumWindows, GetWindowThreadProcessId, ShowWindow, 
     SetForegroundWindow, SW_RESTORE, SW_SHOW, BringWindowToTop,
+    AllowSetForegroundWindow, ASFW_ANY,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -20,7 +21,10 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
 
-    if pid == data.process_id && IsWindowVisible(hwnd).as_bool() {
+    if pid == data.process_id {
+        // We found a window belonging to our process. 
+        // We can check if it has a title or other properties to ensure it's the main window,
+        // but for this app, usually there's only one main window.
         data.window_handle = Some(hwnd);
         return false.into(); // Stop enumeration
     }
@@ -30,6 +34,8 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
 pub fn force_foreground_window() {
     #[cfg(target_os = "windows")]
     unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        
         let process_id = GetCurrentProcessId();
         let mut data = EnumData {
             process_id,
