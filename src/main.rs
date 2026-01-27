@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod gql;
 mod graph_utils;
 mod gui;
@@ -78,9 +78,16 @@ fn main() -> eframe::Result {
     // If background_on_close is enabled and we have a server that could run,
     // start hidden by default on consecutive runs.
     #[cfg(feature = "api")]
-    if settings.background_on_close && (settings.api_enabled || settings.grpc_enabled) {
-        crate::gui::app_state::SHOW_WINDOW.store(false, Ordering::SeqCst);
+    {
+        if settings.background_on_close && (settings.api_enabled || settings.grpc_enabled) {
+            crate::gui::app_state::SHOW_WINDOW.store(false, Ordering::SeqCst);
+        } else {
+            crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
+        }
     }
+
+    #[cfg(not(feature = "api"))]
+    crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
 
     let icon_bytes = include_bytes!("../assets/AppSet.iconset/icon_512x512.png");
     let icon = match eframe::icon_data::from_png_bytes(icon_bytes) {
@@ -148,6 +155,8 @@ fn main() -> eframe::Result {
                     if let Ok(event) = menu_channel.try_recv() {
                         if event.id == show_item_id {
                             crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                             ctx.request_repaint();
                         } else if event.id == quit_item_id {
                             std::process::exit(0);
