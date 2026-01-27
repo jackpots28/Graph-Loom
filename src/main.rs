@@ -20,6 +20,13 @@ use tray_icon::{
 use std::sync::atomic::Ordering;
 
 fn main() -> eframe::Result {
+    {
+        if let Some(pid) = gui::win_utils::find_running_instance() {
+            gui::win_utils::force_foreground_process(pid);
+            return Ok(());
+        }
+    }
+
     #[cfg(feature = "api")]
     let mut background_mode = false;
 
