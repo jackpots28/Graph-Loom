@@ -236,6 +236,9 @@ pub fn start_server(cfg: &AppSettings) -> anyhow::Result<()> {
     // If already running, stop first
     stop_server();
 
+    // Also start gRPC if enabled
+    let _ = super::grpc::start_grpc_server(cfg);
+
     std::thread::spawn(move || {
         let sys = actix_web::rt::System::new();
         sys.block_on(async move {
@@ -265,6 +268,7 @@ pub fn stop_server() {
         // trigger stop (graceful=false)
         let _ = handle.stop(false);
     }
+    super::grpc::stop_grpc_server();
 }
 
 pub fn is_running() -> bool { SERVER_STATE.lock().unwrap().handle.is_some() }

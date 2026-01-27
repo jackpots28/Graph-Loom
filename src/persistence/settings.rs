@@ -27,6 +27,14 @@ pub struct AppSettings {
     pub api_port: u16,
     #[serde(default)]
     pub api_key: Option<String>,
+    // gRPC service configuration
+    #[serde(default)]
+    pub grpc_enabled: bool,
+    #[serde(default = "AppSettings::default_grpc_port")]
+    pub grpc_port: u16,
+    // Whether to continue running in background when GUI window is closed
+    #[serde(default)]
+    pub background_on_close: bool,
 }
 
 impl Default for AppSettings {
@@ -42,6 +50,9 @@ impl Default for AppSettings {
             api_bind_addr: Self::default_bind_addr(),
             api_port: Self::default_port(),
             api_key: None,
+            grpc_enabled: false,
+            grpc_port: Self::default_grpc_port(),
+            background_on_close: false,
         }
     }
 }
@@ -168,6 +179,7 @@ impl AppSettings {
 
     pub(crate) fn default_bind_addr() -> String { "127.0.0.1".to_string() }
     pub(crate) fn default_port() -> u16 { 8787 }
+    pub(crate) fn default_grpc_port() -> u16 { 50051 }
 
     pub fn api_endpoint(&self) -> String {
         format!("{}:{}", self.api_bind_addr, self.api_port)

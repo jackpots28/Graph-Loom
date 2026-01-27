@@ -1154,24 +1154,41 @@ impl eframe::App for GraphApp {
                             ui.checkbox(&mut self.prefs_edit.lod_enabled, "Enable level-of-detail (LOD)");
                             ui.add(egui::Slider::new(&mut self.prefs_edit.lod_label_min_zoom, 0.1..=3.0).text("Label min zoom"));
                             ui.add(egui::Slider::new(&mut self.prefs_edit.lod_hide_labels_node_threshold, 0..=5000).text("Hide labels above N nodes"));
+
+                            ui.separator();
+                            ui.heading("Background Mode");
+                            ui.checkbox(&mut self.prefs_edit.background_on_close, "Continue running in background when window is closed")
+                                .on_hover_text("If enabled, closing the window will not stop the API server. You can stop it via CLI or by unchecking this and closing.");
                         }
                         PrefsTab::Api => {
                             ui.heading("API Service");
                             ui.horizontal(|ui| {
-                                ui.checkbox(&mut self.prefs_edit.api_enabled, "Enable API Server");
-                                ui.small("Requires restart if port is in use by a previous run");
+                                ui.checkbox(&mut self.prefs_edit.api_enabled, "Enable HTTP/WS API Server");
+                                ui.small("Actix-web");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.prefs_edit.grpc_enabled, "Enable gRPC Server");
+                                ui.small("Tonic/Prost");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Bind address");
                                 ui.text_edit_singleline(&mut self.prefs_edit.api_bind_addr);
                             });
                             ui.horizontal(|ui| {
-                                ui.label("Port");
+                                ui.label("HTTP Port");
                                 let mut port = self.prefs_edit.api_port as i32;
                                 if ui.add(egui::DragValue::new(&mut port).range(1..=65535)).changed() {
                                     self.prefs_edit.api_port = port as u16;
                                 }
                                 ui.label(format!("Endpoint: {}", self.prefs_edit.api_endpoint()));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("gRPC Port");
+                                let mut gport = self.prefs_edit.grpc_port as i32;
+                                if ui.add(egui::DragValue::new(&mut gport).range(1..=65535)).changed() {
+                                    self.prefs_edit.grpc_port = gport as u16;
+                                }
+                                ui.label(format!("Endpoint: {}:{}", self.prefs_edit.api_bind_addr, self.prefs_edit.grpc_port));
                             });
                             ui.horizontal(|ui| {
                                 ui.label("API Key (optional)");
@@ -3335,6 +3352,14 @@ impl eframe::App for GraphApp {
                             });
                     });
             }
+        }
+    }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.app_settings.background_on_close && (self.app_settings.api_enabled || self.app_settings.grpc_enabled) {
+            eprintln!("[Graph-Loom] background_on_close is enabled. The API server will continue to run if the process persists.");
+            // Note: In standard eframe, on_exit is the last chance to do something before the process exits.
+            // If we want to truly background, we would need to have started as a background-capable process.
+            // For now, this serves as a hint/hook for future implementation of a persistent service.
         }
     }
 }

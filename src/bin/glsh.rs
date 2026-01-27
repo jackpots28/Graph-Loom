@@ -140,7 +140,7 @@ fn main() {
 
     if !quiet {
         eprintln!(
-            "Connected to {}.\nType queries and press Enter. Commands: :help, :quit. History saved at {}.\n",
+            "Connected to {}.\nType queries and press Enter. Commands: :help, quit / exit. History saved at {}.\n",
             endpoint,
             hist_path.display()
         );

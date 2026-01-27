@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package graph_loom;
+
+service GraphQuery {
+  rpc Execute(QueryRequest) returns (QueryResponse) {}
+}
+
+message QueryRequest {
+  string query = 1;
+  map<string, string> params = 2;
+  bool log = 3;
+}
+
+message QueryResponse {
+  repeated QueryRow rows = 1;
+  uint64 affected_nodes = 2;
+  uint64 affected_relationships = 3;
+  bool mutated = 4;
+  string error = 5;
+}
+
+message QueryRow {
+  oneof item {
+    Node node = 1;
+    Relationship relationship = 2;
+    string info = 3;
+  }
+}
+
+message Node {
+  string id = 1;
+  string label = 2;
+  map<string, string> metadata = 3;
+}
+
+message Relationship {
+  string id = 1;
+  string from_id = 2;
+  string to_id = 3;
+  string label = 4;
+  map<string, string> metadata = 5;
+}

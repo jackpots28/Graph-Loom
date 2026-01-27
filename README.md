@@ -79,6 +79,22 @@ Note: The API feature is enabled by default in builds of the app and controlled 
 - Configure in Settings → Preferences → "API Service (Actix)" → "API log directory". Leave empty to use defaults.
 - Log format (one line per event): `YYYY-MM-DD HH:MM:SS | <event>` where events include server start, HTTP requests and results, WebSocket connects/queries/results, timeouts, and errors.
 
+### Headless Background Mode
+Graph-Loom can run without its GUI frontend, allowing it to act as a pure graph database server.
+
+- **Enabling:** Run the application with the `--background` or `-b` flag.
+  ```bash
+  ./Graph-Loom --background --api-enable
+  ```
+- **Behavior:**
+  - No window will be shown.
+  - The API and gRPC servers will start based on your current settings or CLI overrides.
+  - Graph state is loaded on startup and periodically autosaved if changed.
+  - Press `Ctrl+C` in the terminal to stop.
+- **Background on Close:**
+  - You can enable "Continue running in background when window is closed" in **Settings → Preferences → App Settings**.
+  - This allows you to background the frontend while the backend stays active, similar to Docker Desktop. (Note: Currently requires launching with background support or as a persistent process).
+
 ### CLI client (optional): glsh
 
 Graph-Loom includes an optional command-line client glsh (Graph-Loom Shell) to connect to the API WebSocket REPL.
