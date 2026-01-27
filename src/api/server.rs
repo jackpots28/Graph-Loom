@@ -235,8 +235,6 @@ pub fn start_server(cfg: &AppSettings) -> anyhow::Result<()> {
     let log_dir = cfg.api_log_dir();
     stop_server();
 
-    let _ = super::grpc::start_grpc_server(cfg);
-
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -290,7 +288,6 @@ pub fn stop_server() {
     if let Some(r) = rt {
         r.shutdown_timeout(Duration::from_millis(100));
     }
-    super::grpc::stop_grpc_server();
 }
 
 #[allow(dead_code)]

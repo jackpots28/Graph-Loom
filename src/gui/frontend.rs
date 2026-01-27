@@ -430,8 +430,13 @@ impl GraphApp {
         // Initialize API broker and server based on settings
         let rx = api::init_broker();
         s.api_rx = Some(rx);
-        if s.app_settings.api_enabled || s.app_settings.grpc_enabled {
+        if s.app_settings.api_enabled {
             let _ = api::server::start_server(&s.app_settings);
+        }
+        if s.app_settings.grpc_enabled {
+            let _ = api::grpc::start_grpc_server(&s.app_settings);
+        }
+        if s.app_settings.api_enabled || s.app_settings.grpc_enabled {
             s.api_running = true;
         }
         s
@@ -914,8 +919,13 @@ impl GraphApp {
         // Initialize API broker and server based on settings
         let rx = api::init_broker();
         s.api_rx = Some(rx);
-        if s.app_settings.api_enabled || s.app_settings.grpc_enabled {
+        if s.app_settings.api_enabled {
             let _ = api::server::start_server(&s.app_settings);
+        }
+        if s.app_settings.grpc_enabled {
+            let _ = api::grpc::start_grpc_server(&s.app_settings);
+        }
+        if s.app_settings.api_enabled || s.app_settings.grpc_enabled {
             s.api_running = true;
         }
         s
@@ -1270,6 +1280,7 @@ impl eframe::App for GraphApp {
                                 Ok(()) => {
                                     // Determine if API server config changed
                                     let old_api = (self.app_settings.api_enabled.clone(), self.app_settings.api_bind_addr.clone(), self.app_settings.api_port, self.app_settings.api_key.clone());
+                                    let old_grpc = (self.app_settings.grpc_enabled.clone(), self.app_settings.grpc_port, self.app_settings.api_bind_addr.clone(), self.app_settings.api_key.clone());
                                     // Detect export dir change to refresh default export paths in views
                                     let old_export_dir = self.app_settings.export_dir();
                                     self.app_settings = self.prefs_edit.clone();
@@ -1278,16 +1289,24 @@ impl eframe::App for GraphApp {
                                     self.lod_label_min_zoom = self.app_settings.lod_label_min_zoom;
                                     self.lod_hide_labels_node_threshold = self.app_settings.lod_hide_labels_node_threshold;
                                     let new_api = (self.app_settings.api_enabled.clone(), self.app_settings.api_bind_addr.clone(), self.app_settings.api_port, self.app_settings.api_key.clone());
+                                    let new_grpc = (self.app_settings.grpc_enabled.clone(), self.app_settings.grpc_port, self.app_settings.api_bind_addr.clone(), self.app_settings.api_key.clone());
+                                    
                                     if old_api != new_api {
                                         // Restart server
                                         api::server::stop_server();
                                         if self.app_settings.api_enabled {
                                             let _ = api::server::start_server(&self.app_settings);
-                                            self.api_running = true;
-                                        } else {
-                                            self.api_running = false;
                                         }
                                     }
+
+                                    if old_grpc != new_grpc {
+                                        api::grpc::stop_grpc_server();
+                                        if self.app_settings.grpc_enabled {
+                                            let _ = api::grpc::start_grpc_server(&self.app_settings);
+                                        }
+                                    }
+
+                                    self.api_running = self.app_settings.api_enabled || self.app_settings.grpc_enabled;
 
                                     let new_export_dir = self.app_settings.export_dir();
                                     if old_export_dir != new_export_dir {
