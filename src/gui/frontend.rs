@@ -13,9 +13,8 @@ use crate::persistence::persist::{self, AppStateFile};
 use crate::persistence::settings::AppSettings;
 use crate::gql::query_interface::{self, QueryResultRow};
 use crate::api::{self, ApiRequest};
-// All menus are implemented in-window via egui (no native menu plumbing)
 
-// Helpers for exporting matched nodes
+// Export matched nodes
 fn export_nodes_json(db: &GraphDatabase, ids: &[NodeId], path: &std::path::Path) -> std::io::Result<()> {
     use std::fs::File;
     use std::io::Write;
@@ -88,7 +87,6 @@ fn export_graph_json(db: &GraphDatabase, path: &std::path::Path) -> std::io::Res
         relationships: Vec<RelOut<'a>>,
     }
 
-    // Build per-node rel refs
     let mut node_outs: Vec<NodeOut> = Vec::with_capacity(db.nodes.len());
     for (_id, node) in db.nodes.iter() {
         let mut out_rels: Vec<RelRef> = Vec::new();
@@ -2463,7 +2461,7 @@ impl eframe::App for GraphApp {
             }
 
             // Panning: update pan based on background drag delta, if not in multi-select mode
-            // and no node is being dragged. We check any_node_dragged later.
+            // and no node is being dragged.
 
             let painter = ui.painter_at(available);
 
@@ -2519,40 +2517,38 @@ impl eframe::App for GraphApp {
                     let a = to_screen(*pa);
                     let b = to_screen(*pb);
                     let incident_hover = self.hover_node.map(|h| h == rel.from_node || h == rel.to_node).unwrap_or(false);
-                    // Highlight if selected AND the popout for this relationship is open
-                    let is_sel = matches!(self.selected, Some(SelectedItem::Rel(id)) if id == rel.id)
-                        && self.open_rel_windows.contains(&rel.id);
-                    let is_qsel = self.query_selected_rels.contains(&rel.id);
-                    let mut stroke = if is_sel {
-                        Stroke { width: 3.0, color: Color32::from_rgb(255, 200, 80) }
-                    } else if is_qsel || incident_hover {
-                        Stroke { width: 2.5, color: Color32::from_rgb(120, 220, 255) }
-                    } else {
-                        edge_stroke
-                    };
-                    // Dim edges when hovering another node
-                    if self.hover_node.is_some() && !incident_hover && !is_sel && !is_qsel {
-                        let c = stroke.color; stroke.color = Color32::from_rgba_premultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * 0.4) as u8);
-                    }
+            // Highlight if selected AND the popout for this relationship is open
+            let is_sel = matches!(self.selected, Some(SelectedItem::Rel(id)) if id == rel.id)
+                && self.open_rel_windows.contains(&rel.id);
+            let is_qsel = self.query_selected_rels.contains(&rel.id);
+            let mut stroke = if is_sel {
+                Stroke { width: 3.0, color: Color32::from_rgb(255, 200, 80) }
+            } else if is_qsel || incident_hover {
+                Stroke { width: 2.5, color: Color32::from_rgb(120, 220, 255) }
+            } else {
+                edge_stroke
+            };
+            // Dim edges when hovering another node
+            if self.hover_node.is_some() && !incident_hover && !is_sel && !is_qsel {
+                let c = stroke.color; stroke.color = Color32::from_rgba_premultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * 0.4) as u8);
+            }
 
-                    // Curvature: offset midpoint along perpendicular; stable by hashing endpoints
-                    let dir = Vec2::new(b.x - a.x, b.y - a.y);
-                    let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
-                    if len > 1.0 {
-                        let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
-                        let n = Vec2::new(-dir.y / len, dir.x / len);
-                        let mut seed = rel.from_node.as_u128() ^ rel.to_node.as_u128();
-                        // cheap hash to decide side and magnitude
-                        seed ^= seed >> 33;
-                        let sign = if (seed & 1) == 0 { 1.0 } else { -1.0 };
-                        let mag = (8.0 * self.zoom).clamp(2.0, 16.0);
-                        let ctrl = mid + n * (mag * sign as f32);
-                        // approximate quadratic curve with two segments: a->ctrl and ctrl->b
-                        painter.line_segment([a, ctrl], stroke);
-                        painter.line_segment([ctrl, b], stroke);
-                    } else {
-                        painter.line_segment([a, b], stroke);
-                    }
+            // Curvature: offset midpoint along perpendicular; stable by hashing endpoints
+            let dir = Vec2::new(b.x - a.x, b.y - a.y);
+            let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
+            if len > 1.0 {
+                let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                let n = Vec2::new(-dir.y / len, dir.x / len);
+                let mut seed = rel.from_node.as_u128() ^ rel.to_node.as_u128();
+                seed ^= seed >> 33;
+                let sign = if (seed & 1) == 0 { 1.0 } else { -1.0 };
+                let mag = (8.0 * self.zoom).clamp(2.0, 16.0);
+                let ctrl = mid + n * (mag * sign as f32);
+                painter.line_segment([a, ctrl], stroke);
+                painter.line_segment([ctrl, b], stroke);
+            } else {
+                painter.line_segment([a, b], stroke);
+            }
 
                     // Relationship label at midpoint with improved LOD visibility and pill background
                     let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);

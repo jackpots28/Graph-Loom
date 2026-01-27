@@ -19,10 +19,6 @@ use tray_icon::{
 use std::sync::atomic::Ordering;
 
 fn main() -> eframe::Result {
-    // Optional: enable/run embedded API server from CLI flags (when compiled with `api` feature)
-    // Usage examples:
-    //   Graph-Loom --api-enable
-    //   Graph-Loom --api-enable --api-bind 0.0.0.0 --api-port 8787 --api-key secret
     #[cfg(feature = "api")]
     let mut background_mode = false;
 
@@ -38,7 +34,7 @@ fn main() -> eframe::Result {
             if args.iter().any(|a| a == "--background") || args.iter().any(|a| a == "-b") {
                 background_mode = true;
             }
-            // parse simple flags
+            // parse flags
             let mut i = 0usize;
             while i < args.len() {
                 match args[i].as_str() {
@@ -63,7 +59,7 @@ fn main() -> eframe::Result {
             }
             let _ = settings.save();
             persistence::persist::set_settings_override(settings.clone());
-            eprintln!("[Graph-Loom] API enabled on {} (configured in Preferences)", settings.api_endpoint());
+            eprintln!("[Graph-Loom] API enabled on {}", settings.api_endpoint());
             if settings.grpc_enabled {
                 eprintln!("[Graph-Loom] gRPC enabled on {}:{}", settings.api_bind_addr, settings.grpc_port);
             }

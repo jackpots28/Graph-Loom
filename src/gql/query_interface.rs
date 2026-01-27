@@ -142,7 +142,6 @@ pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome
     Ok(outcome)
 }
 
-// Only used by tests; silence dead_code in normal builds while keeping it available to tests
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn execute_and_log(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome> {
     let res = execute_query(db, query);
@@ -150,11 +149,7 @@ pub fn execute_and_log(db: &mut GraphDatabase, query: &str) -> Result<QueryOutco
     res
 }
 
-/// Execute a query with parameters (for OpenCypher `$param` usage) and return an outcome.
-/// This preserves legacy command compatibility and routes true Cypher statements to the
-/// parameter-aware engine. Parameters are simple string map values; numbers should be
-/// provided as strings and will be compared numerically where supported by the engine.
-// Public entry point primarily for tests; keep available but avoid unused warnings in normal builds
+/// Execute a query with parameters (for OpenCypher `$param` usage).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn execute_query_with_params(
     db: &mut GraphDatabase,
@@ -173,10 +168,10 @@ pub fn execute_query_with_params(
         let stmt = stmt.trim();
         if stmt.is_empty() { continue; }
         let upper = stmt.to_uppercase();
-        // First: legacy minimal Cypher-style handler for pairwise MATCH...MERGE in one statement
+        // First: legacy minimal Cypher-style handler for pairwise MATCH...MERGE
         let res = if upper.starts_with("MATCH (") && upper.contains(" MERGE ") {
             exec_cypher_match_merge(db, stmt)
-        // If the statement appears to be OpenCypher, route to the Cypher engine (with params).
+        // True Cypher engine path
         } else if (upper.starts_with("MATCH ") && stmt[6..].trim_start().starts_with('(')) ||
         (upper.starts_with("OPTIONAL MATCH ") && stmt[15..].trim_start().starts_with('(')) ||
         upper.starts_with("MERGE ") ||
@@ -214,7 +209,6 @@ pub fn execute_query_with_params(
 }
 
 /// Same as execute_and_log but accepts parameters for OpenCypher `$param`s.
-// Private helper for tests; suppress dead_code outside of test builds
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn _execute_and_log_with_params(
     db: &mut GraphDatabase,
@@ -222,7 +216,6 @@ pub fn _execute_and_log_with_params(
     params: &HashMap<String, String>,
 ) -> Result<QueryOutcome> {
     let res = execute_query_with_params(db, query, params);
-    // Basic logging of query; parameters are not recorded to avoid leaking sensitive info
     log_query(query, &res);
     res
 }

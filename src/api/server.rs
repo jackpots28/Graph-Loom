@@ -226,18 +226,15 @@ impl actix::StreamHandler<Result<ws::Message, ws::ProtocolError>> for ReplWs {
 
 async fn ws_handler(cfg: web::Data<Cfg>, req: HttpRequest, stream: web::Payload) -> actix_web::Result<HttpResponse> {
     if !check_api_key(&req, &cfg) { return Ok(unauthorized()); }
-    let resp = ws::start(ReplWs::new(cfg.get_ref().clone()), &req, stream);
-    resp
+    ws::start(ReplWs::new(cfg.get_ref().clone()), &req, stream)
 }
 
 pub fn start_server(cfg: &AppSettings) -> anyhow::Result<()> {
     let bind = cfg.api_endpoint();
     let api_key = cfg.api_key.clone();
     let log_dir = cfg.api_log_dir();
-    // If already running, stop first
     stop_server();
 
-    // Also start gRPC if enabled
     let _ = super::grpc::start_grpc_server(cfg);
 
     std::thread::spawn(move || {
