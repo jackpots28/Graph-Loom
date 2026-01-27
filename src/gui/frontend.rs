@@ -432,7 +432,7 @@ impl GraphApp {
         // Initialize API broker and server based on settings
         let rx = api::init_broker();
         s.api_rx = Some(rx);
-        if s.app_settings.api_enabled {
+        if s.app_settings.api_enabled || s.app_settings.grpc_enabled {
             let _ = api::server::start_server(&s.app_settings);
             s.api_running = true;
         }
@@ -750,42 +750,50 @@ impl GraphApp {
                 (-1,  1), (0,  1), (1,  1),
             ];
 
-            for (&(ix, iy), ids) in grid.clone().iter() {
-                for (dx, dy) in offsets {
-                    let key = (ix + dx, iy + dy);
-                    if let Some(neigh_ids) = grid.get(&key) {
-                        for &a in ids {
-                            for &b in neigh_ids {
-                                if a >= b { continue; } // avoid double-processing and self
-                                let (Some(&pa), Some(&pb)) = (
-                                    self.node_positions.get(&a),
-                                    self.node_positions.get(&b),
-                                ) else { continue; };
-                                let dx = pb.x - pa.x;
-                                let dy = pb.y - pa.y;
-                                let d2 = dx*dx + dy*dy;
-                                if d2 < min_dist_sq && d2 > 1e-6 {
-                                    let d = d2.sqrt();
-                                    let overlap = (min_dist - d) * 0.5; // split push
-                                    let nx = dx / d;
-                                    let ny = dy / d;
-                                    if let Some(p) = self.node_positions.get_mut(&a) {
-                                        p.x -= nx * overlap;
-                                        p.y -= ny * overlap;
-                                    }
-                                    if let Some(p) = self.node_positions.get_mut(&b) {
-                                        p.x += nx * overlap;
-                                        p.y += ny * overlap;
-                                    }
-                                } else if d2 <= 1e-6 {
-                                    // Same position: nudge apart deterministically
-                                    if let Some(pa_mut) = self.node_positions.get_mut(&a) {
-                                        pa_mut.x -= 0.5 * min_dist;
-                                        pa_mut.y -= 0.3 * min_dist;
-                                    }
-                                    if let Some(pb_mut) = self.node_positions.get_mut(&b) {
-                                        pb_mut.x += 0.5 * min_dist;
-                                        pb_mut.y += 0.3 * min_dist;
+            // Collect keys to avoid cloning the whole grid for iteration
+            let keys: Vec<(i32, i32)> = grid.keys().cloned().collect();
+
+            for (ix, iy) in keys {
+                if let Some(ids) = grid.get(&(ix, iy)) {
+                    for (dx, dy) in offsets {
+                        let key = (ix + dx, iy + dy);
+                        if let Some(neigh_ids) = grid.get(&key) {
+                            for &a in ids {
+                                for &b in neigh_ids {
+                                    if a >= b { continue; } // avoid double-processing and self
+                                    
+                                    // Use a single borrow check if possible
+                                    let (pa, pb) = match (self.node_positions.get(&a), self.node_positions.get(&b)) {
+                                        (Some(pa), Some(pb)) => (*pa, *pb),
+                                        _ => continue,
+                                    };
+                                    
+                                    let dx = pb.x - pa.x;
+                                    let dy = pb.y - pa.y;
+                                    let d2 = dx*dx + dy*dy;
+                                    if d2 < min_dist_sq && d2 > 1e-6 {
+                                        let d = d2.sqrt();
+                                        let overlap = (min_dist - d) * 0.5; // split push
+                                        let nx = dx / d;
+                                        let ny = dy / d;
+                                        if let Some(p) = self.node_positions.get_mut(&a) {
+                                            p.x -= nx * overlap;
+                                            p.y -= ny * overlap;
+                                        }
+                                        if let Some(p) = self.node_positions.get_mut(&b) {
+                                            p.x += nx * overlap;
+                                            p.y += ny * overlap;
+                                        }
+                                    } else if d2 <= 1e-6 {
+                                        // Same position: nudge apart deterministically
+                                        if let Some(pa_mut) = self.node_positions.get_mut(&a) {
+                                            pa_mut.x -= 0.5 * min_dist;
+                                            pa_mut.y -= 0.3 * min_dist;
+                                        }
+                                        if let Some(pb_mut) = self.node_positions.get_mut(&b) {
+                                            pb_mut.x += 0.5 * min_dist;
+                                            pb_mut.y += 0.3 * min_dist;
+                                        }
                                     }
                                 }
                             }
@@ -908,7 +916,7 @@ impl GraphApp {
         // Initialize API broker and server based on settings
         let rx = api::init_broker();
         s.api_rx = Some(rx);
-        if s.app_settings.api_enabled {
+        if s.app_settings.api_enabled || s.app_settings.grpc_enabled {
             let _ = api::server::start_server(&s.app_settings);
             s.api_running = true;
         }
@@ -1067,27 +1075,48 @@ impl GraphApp {
 
 impl eframe::App for GraphApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Process pending API requests (execute queries on the GUI thread safely)
-        if let Some(rx) = &self.api_rx {
-            for req in rx.try_iter() {
-                let t0 = std::time::Instant::now();
-                // Execute query on GUI thread
-                let res = match &req.params {
-                    Some(p) => query_interface::execute_query_with_params(&mut self.db, &req.query, p),
-                    None => query_interface::execute_and_log(&mut self.db, &req.query),
-                };
-                let dt = t0.elapsed();
-                // Debug print for visibility in console during development
-                eprintln!(
-                    "[API GUI] RID={} done mutated={} dt_ms={}",
-                    req.request_id,
-                    res.as_ref().map(|o| o.mutated).unwrap_or(false),
-                    dt.as_millis()
-                );
-                // Best effort respond; ignore send errors if client disconnected
-                let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
+        // Handle window close event for backgrounding
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.app_settings.background_on_close && (self.app_settings.api_enabled || self.app_settings.grpc_enabled) {
+                // Use the static from gui::app_state
+                crate::gui::app_state::SHOW_WINDOW.store(false, std::sync::atomic::Ordering::SeqCst);
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
+
+        // Handle window visibility and background mode
+        if !crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+
+    // Process pending API requests (execute queries on the GUI thread safely)
+    if let Some(rx) = &self.api_rx {
+        // Limit processing per frame to avoid freezing the GUI
+        let mut count = 0;
+        while let Ok(req) = rx.try_recv() {
+            let t0 = std::time::Instant::now();
+            // Execute query on GUI thread
+            let res = match &req.params {
+                Some(p) => query_interface::execute_query_with_params(&mut self.db, &req.query, p),
+                None => query_interface::execute_and_log(&mut self.db, &req.query),
+            };
+            let dt = t0.elapsed();
+            // Debug print for visibility in console during development
+            eprintln!(
+                "[API GUI] RID={} done mutated={} dt_ms={}",
+                req.request_id,
+                res.as_ref().map(|o| o.mutated).unwrap_or(false),
+                dt.as_millis()
+            );
+            // Best effort respond; ignore send errors if client disconnected
+            let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
+            
+            count += 1;
+            if count >= 5 { break; } // Process at most 5 requests per frame
+        }
+    }
         // Native menu command handling removed; in-window menus cover these actions
 
         // Preferences window
@@ -1158,17 +1187,15 @@ impl eframe::App for GraphApp {
                             ui.separator();
                             ui.heading("Background Mode");
                             ui.checkbox(&mut self.prefs_edit.background_on_close, "Continue running in background when window is closed")
-                                .on_hover_text("If enabled, closing the window will not stop the API server. You can stop it via CLI or by unchecking this and closing.");
+                                .on_hover_text("If enabled, closing the window will not stop the API server. You can restore the window from the system tray icon.");
                         }
                         PrefsTab::Api => {
                             ui.heading("API Service");
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.prefs_edit.api_enabled, "Enable HTTP/WS API Server");
-                                ui.small("Actix-web");
                             });
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.prefs_edit.grpc_enabled, "Enable gRPC Server");
-                                ui.small("Tonic/Prost");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Bind address");
@@ -1979,7 +2006,7 @@ impl eframe::App for GraphApp {
                                     (text[i..end].to_string(), i)
                                 } else { (String::new(), text.len()) };
 
-                                // Build suggestion universe
+                                // Build suggestion universe (cached)
                                 let mut pool: Vec<String> = Vec::new();
                                 const KEYWORDS: &[&str] = &[
                                     "MATCH","OPTIONAL","OPTIONAL MATCH","WHERE","RETURN","ORDER BY","SKIP","LIMIT",
@@ -1987,23 +2014,25 @@ impl eframe::App for GraphApp {
                                     "DISTINCT","ASC","DESC",
                                 ];
                                 pool.extend(KEYWORDS.iter().map(|s| s.to_string()));
-                                // Dynamic: node labels, relationship types, common property keys
-                                use std::collections::BTreeSet;
-                                let mut labels: BTreeSet<String> = BTreeSet::new();
-                                let mut rels: BTreeSet<String> = BTreeSet::new();
-                                let mut props: BTreeSet<String> = BTreeSet::new();
-                                for n in self.db.nodes.values() {
-                                    if !n.label.is_empty() { labels.insert(n.label.clone()); }
-                                    for k in n.metadata.keys() { props.insert(k.clone()); }
+                                
+                                // Only add dynamic items if DB is small enough or if we really need to
+                                // For performance, we could cache this, but let's at least limit it
+                                if self.db.nodes.len() < 1000 {
+                                    let mut labels: BTreeSet<String> = BTreeSet::new();
+                                    let mut rels: BTreeSet<String> = BTreeSet::new();
+                                    let mut props: BTreeSet<String> = BTreeSet::new();
+                                    for n in self.db.nodes.values() {
+                                        if !n.label.is_empty() { labels.insert(n.label.clone()); }
+                                        for k in n.metadata.keys() { props.insert(k.clone()); }
+                                    }
+                                    for r in self.db.relationships.values() {
+                                        if !r.label.is_empty() { rels.insert(r.label.clone()); }
+                                        for k in r.metadata.keys() { props.insert(k.clone()); }
+                                    }
+                                    pool.extend(labels.into_iter().map(|l| format!(":{}", l)));
+                                    pool.extend(rels.into_iter().map(|t| format!(":{}", t)));
+                                    pool.extend(props.into_iter().map(|p| format!("{}.{}", "n", p)));
                                 }
-                                for r in self.db.relationships.values() {
-                                    if !r.label.is_empty() { rels.insert(r.label.clone()); }
-                                    for k in r.metadata.keys() { props.insert(k.clone()); }
-                                }
-                                pool.extend(labels.into_iter().map(|l| format!(":{}", l))); // label suggestions
-                                // relationship types as :TYPE
-                                pool.extend(rels.into_iter().map(|t| format!(":{}", t)));
-                                pool.extend(props.into_iter().map(|p| format!("{}.{}", "n", p))); // simple property access example
 
                                 // Filter by prefix (case-insensitive)
                                 let pfx_up = prefix.to_uppercase();
@@ -2360,52 +2389,17 @@ impl eframe::App for GraphApp {
             }
             self.ensure_layout(available);
 
-            // Panning with middle mouse or dragging background (disabled for left-drag when multi-select rectangle is active)
-            let bg_resp = ui.allocate_rect(available, Sense::click_and_drag());
-            if bg_resp.dragged_by(egui::PointerButton::Middle)
-                || (bg_resp.dragged() && self.dragging.is_none() && !self.multi_select_active)
-            {
-                self.pan += bg_resp.drag_delta();
-            }
+            // Background allocation for panning/clicking, restricted when something is likely being dragged or interacted with.
+            // We give nodes first priority for drag; bg_resp gets what's left.
+            let bg_sense = Sense::click_and_drag();
+            let bg_resp = ui.allocate_rect(available, bg_sense);
+
             // cancel pick with Esc
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.pick_target = None;
             }
-            // Zoom with scroll only when pointer is over the canvas area
-            if bg_resp.hovered() {
-                let scroll = ui.input(|i| i.raw_scroll_delta.y);
-                if scroll != 0.0 {
-                    let factor = (1.0 + scroll * 0.001).clamp(0.9, 1.1);
-                    self.zoom = (self.zoom * factor).clamp(0.25, 2.0);
-                    // Show transient zoom HUD
-                    self.zoom_hud_until = Some(Instant::now() + Duration::from_millis(1000));
-                    ui.ctx().request_repaint_after(Duration::from_millis(16));
-                }
-            }
 
-            let painter = ui.painter_at(available);
-
-            // Draw transient zoom HUD if active
-            if let Some(until) = self.zoom_hud_until {
-                let now = Instant::now();
-                if now < until {
-                    let text = format!("{:.2}x", self.zoom);
-                    let font = egui::FontId::proportional(14.0);
-                    let galley = ui.painter().layout_no_wrap(text, font, Color32::WHITE);
-                    let pad = Vec2::new(8.0, 4.0);
-                    let size = galley.size() + pad * 2.0;
-                    let pos = Pos2::new(available.center().x - size.x * 0.5, available.top() + 12.0);
-                    let rect = Rect::from_min_size(pos, size);
-                    let bg = Color32::from_rgba_premultiplied(20, 20, 20, 200);
-                    painter.rect_filled(rect, 8.0, bg);
-                    painter.galley(pos + pad, galley, Color32::WHITE);
-                    ui.ctx().request_repaint_after(Duration::from_millis(16));
-                } else {
-                    self.zoom_hud_until = None;
-                }
-            }
-
-            // Helper to transform world->screen using captured pan/zoom to avoid borrowing self
+            // Helpers to transform between world and screen space
             let center = available.center();
             let zoom = self.zoom;
             let pan = self.pan;
@@ -2415,7 +2409,6 @@ impl eframe::App for GraphApp {
                     (p.y - center.y) * zoom + center.y + pan.y,
                 )
             };
-            // Inverse: screen -> world
             let from_screen = move |p: Pos2| -> Pos2 {
                 Pos2::new(
                     ((p.x - pan.x) - center.x) / zoom + center.x,
@@ -2455,6 +2448,43 @@ impl eframe::App for GraphApp {
                 // Ensure rectangle state is cleared when not in multi-select mode
                 self.rect_select_start = None;
                 self.rect_select_current = None;
+            }
+
+            // Zoom with scroll only when pointer is over the canvas area
+            if bg_resp.hovered() {
+                let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll != 0.0 {
+                    let factor = (1.0 + scroll * 0.001).clamp(0.9, 1.1);
+                    self.zoom = (self.zoom * factor).clamp(0.25, 2.0);
+                    // Show transient zoom HUD
+                    self.zoom_hud_until = Some(Instant::now() + Duration::from_millis(1000));
+                    ui.ctx().request_repaint_after(Duration::from_millis(16));
+                }
+            }
+
+            // Panning: update pan based on background drag delta, if not in multi-select mode
+            // and no node is being dragged. We check any_node_dragged later.
+
+            let painter = ui.painter_at(available);
+
+            // Draw transient zoom HUD if active
+            if let Some(until) = self.zoom_hud_until {
+                let now = Instant::now();
+                if now < until {
+                    let text = format!("{:.2}x", self.zoom);
+                    let font = egui::FontId::proportional(14.0);
+                    let galley = ui.painter().layout_no_wrap(text, font, Color32::WHITE);
+                    let pad = Vec2::new(8.0, 4.0);
+                    let size = galley.size() + pad * 2.0;
+                    let pos = Pos2::new(available.center().x - size.x * 0.5, available.top() + 12.0);
+                    let rect = Rect::from_min_size(pos, size);
+                    let bg = Color32::from_rgba_premultiplied(20, 20, 20, 200);
+                    painter.rect_filled(rect, 8.0, bg);
+                    painter.galley(pos + pad, galley, Color32::WHITE);
+                    ui.ctx().request_repaint_after(Duration::from_millis(16));
+                } else {
+                    self.zoom_hud_until = None;
+                }
             }
 
             // Determine hover before drawing for highlighting/dimming
@@ -2575,10 +2605,9 @@ impl eframe::App for GraphApp {
             }
 
             // Draw and interact with nodes
-            let node_radius = 10.0 * self.zoom; // scale with zoom for easier hit testing
+            let node_radius_draw = 10.0 * self.zoom; // scale with zoom for easier hit testing
             let mut clicked_node: Option<NodeId> = None;
             let mut any_node_dragged = false;
-            // Track drag state transition to restart convergence timer
             let was_dragging = self.dragging.is_some();
 
             // Iterate over a snapshot of ids to avoid borrowing conflicts when we
@@ -2590,7 +2619,7 @@ impl eframe::App for GraphApp {
                 // Safe to immutably read the node after the mutable borrow in get_or_init_position ends
                 let node = match self.db.nodes.get(&id) { Some(n) => n, None => continue };
                 let pos_screen = to_screen(pos_world);
-                let rect = Rect::from_center_size(pos_screen, Vec2::splat(node_radius * 2.0));
+                let rect = Rect::from_center_size(pos_screen, Vec2::splat(node_radius_draw * 2.0));
                 let resp = ui.allocate_rect(rect, Sense::click_and_drag());
 
                 // Soft dragging: we don't directly set position here; we mark dragging and add a spring-to-mouse force later.
@@ -2641,12 +2670,12 @@ impl eframe::App for GraphApp {
                 let mut stroke = if is_selected { Stroke::new(2.0, Color32::WHITE) } else { Stroke::new(1.5, Color32::DARK_GRAY) };
                 if self.create_rel_from == Some(id) { stroke = Stroke::new(2.5, Color32::from_rgb(80, 220, 120)); }
                 if self.create_rel_to == Some(id) { stroke = Stroke::new(2.5, Color32::from_rgb(255, 170, 60)); }
-                painter.circle_filled(pos_screen, node_radius, fill);
-                painter.circle_stroke(pos_screen, node_radius, stroke);
+                painter.circle_filled(pos_screen, node_radius_draw, fill);
+                painter.circle_stroke(pos_screen, node_radius_draw, stroke);
 
                 // Bulk select halo indicator (independent from popout selection)
                 if self.multi_selected_nodes.contains(&id) {
-                    let halo_r = node_radius + (3.0 * self.zoom).clamp(2.0, 8.0);
+                    let halo_r = node_radius_draw + (3.0 * self.zoom).clamp(2.0, 8.0);
                     painter.circle_stroke(
                         pos_screen,
                         halo_r,
@@ -2666,7 +2695,7 @@ impl eframe::App for GraphApp {
                 if show_label {
                     let text = format_short_node(&self.db, id);
                     let label_color = GraphApp::color_for_label(&node.label);
-                    let pos_text = pos_screen + Vec2::new(0.0, -node_radius - 4.0);
+                    let pos_text = pos_screen + Vec2::new(0.0, -node_radius_draw - 4.0);
                     // multi-direction halo for readability
                     painter.text(
                         pos_text + Vec2::new(0.0, 1.0),
@@ -2693,7 +2722,7 @@ impl eframe::App for GraphApp {
 
                 // Query-match halo indicator
                 if self.query_selected_nodes.contains(&id) {
-                    let halo_r = node_radius + (5.0 * self.zoom).clamp(2.0, 10.0);
+                    let halo_r = node_radius_draw + (5.0 * self.zoom).clamp(2.0, 10.0);
                     painter.circle_stroke(
                         pos_screen,
                         halo_r,
@@ -2756,6 +2785,16 @@ impl eframe::App for GraphApp {
                     self.converge_start = Some(Instant::now());
                 }
                 self.dragging = None;
+
+                // Background Panning: update pan based on background drag delta,
+                // if not in multi-select mode and no node was dragged this frame.
+                if !self.multi_select_active {
+                    let delta = bg_resp.drag_delta();
+                    if delta != Vec2::ZERO {
+                        self.pan += delta;
+                        self.mark_dirty();
+                    }
+                }
             }
             if any_node_dragged { self.mark_dirty(); }
 
@@ -2840,7 +2879,7 @@ impl eframe::App for GraphApp {
             // Smooth convergence using a simple spring-damper integration.
             // Neo4j-style aids for large graphs: center gravity and degree-aware repulsion.
             let active = match self.converge_start { Some(t0) => t0.elapsed() < Duration::from_secs(5), None => false };
-            if active {
+            if active || any_node_dragged || self.dragging.is_some() {
                 // Nodes connected by relationships experience a spring force toward a target length.
                 // Nearby nodes experience a soft repulsive force to maintain spacing.
                 // We integrate per-node velocities with damping for fluid motion.

@@ -4,12 +4,19 @@ mod gui;
 mod persistence;
 mod api;
 
+use std::collections::HashMap;
 use graph_utils::graph::GraphDatabase;
 use gui::frontend::GraphApp;
 use persistence::persist;
 
 use eframe::egui;
 // All menus are now implemented within the egui window; no platform-specific menu code.
+
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem},
+    TrayIconBuilder,
+};
+use std::sync::atomic::Ordering;
 
 fn main() -> eframe::Result {
     // Optional: enable/run embedded API server from CLI flags (when compiled with `api` feature)
@@ -71,11 +78,51 @@ fn main() -> eframe::Result {
         return run_background(settings);
     }
 
-    let icon = eframe::icon_data::from_png_bytes(
-        // Really need a different icon...
-        include_bytes!("../assets/AppSet.iconset/icon_512x512.png"),
-    )
-    .expect("Failed to load icon");
+    // If background_on_close is enabled and we have a server that could run,
+    // start hidden by default on consecutive runs.
+    #[cfg(feature = "api")]
+    if settings.background_on_close && (settings.api_enabled || settings.grpc_enabled) {
+        crate::gui::app_state::SHOW_WINDOW.store(false, Ordering::SeqCst);
+    }
+
+    let icon_bytes = include_bytes!("../assets/AppSet.iconset/icon_512x512.png");
+    let icon = match eframe::icon_data::from_png_bytes(icon_bytes) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[Graph-Loom] Failed to load window icon: {}", e);
+            // Fallback: we could return an error, but eframe::run_native needs eframe::Result which is specific.
+            // Let's just panic here with a clear message or use a simpler error.
+            panic!("Icon load failed: {}", e);
+        }
+    };
+
+    // Initialize Tray Icon
+    let tray_menu = Menu::new();
+    let show_item = MenuItem::new("Show Graph-Loom", true, None);
+    let quit_item = MenuItem::new("Quit", true, None);
+    let _ = tray_menu.append(&show_item);
+    let _ = tray_menu.append(&quit_item);
+
+    let tray_icon_data = match tray_icon::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[Graph-Loom] Failed to create tray icon: {}", e);
+            panic!("Tray icon creation failed: {}", e);
+        }
+    };
+
+    let mut _tray_icon = match TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_tooltip("Graph-Loom")
+        .with_icon(tray_icon_data)
+        .build() {
+            Ok(i) => Some(i),
+            Err(e) => {
+                eprintln!("[Graph-Loom] Failed to build tray icon: {}", e);
+                None // Non-fatal if we can't show tray? Actually user might want it.
+            }
+        };
+
     let loaded_state = persist::load_active().ok().flatten();
 
     env_logger::init();
@@ -88,10 +135,31 @@ fn main() -> eframe::Result {
             .with_icon(icon),
         ..Default::default()
     };
+
+    let show_item_id = show_item.id().clone();
+    let quit_item_id = quit_item.id().clone();
+
     eframe::run_native(
         "Graph-Loom",
         options,
         Box::new(move |cc| {
+            // Setup tray event listener
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let menu_channel = MenuEvent::receiver();
+                loop {
+                    if let Ok(event) = menu_channel.try_recv() {
+                        if event.id == show_item_id {
+                            crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
+                            ctx.request_repaint();
+                        } else if event.id == quit_item_id {
+                            std::process::exit(0);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+
             if let Some(state) = loaded_state {
                 let app = GraphApp::from_state(state);
                 #[cfg(feature = "api")]
@@ -170,12 +238,13 @@ fn run_background(settings: persistence::settings::AppSettings) -> eframe::Resul
 
         // Periodic save
         if dirty && last_save.elapsed() > Duration::from_secs(5) {
-            let state = persist::AppStateFile {
-                db: db.clone(),
-                node_positions: vec![], // positions not easily available/needed in background?
-                pan: (0.0, 0.0),
-                zoom: 1.0,
-            };
+            // Note: in background mode, db is local so we can use it to create owned state
+            let state = persist::AppStateFile::from_runtime_owned(
+                db.clone(),
+                &HashMap::new(), // positions not easily available/needed in background?
+                egui::Vec2::ZERO,
+                1.0,
+            );
             if let Err(e) = persist::save_active(&state) {
                 eprintln!("[Graph-Loom] Background save failed: {}", e);
             } else {
@@ -185,6 +254,27 @@ fn run_background(settings: persistence::settings::AppSettings) -> eframe::Resul
             }
         }
 
-        std::thread::sleep(Duration::from_millis(100));
+        // Use recv_timeout to wait for requests instead of busy-sleep
+        if let Ok(req) = rx.recv_timeout(Duration::from_millis(500)) {
+            let t0 = Instant::now();
+            let res = match &req.params {
+                Some(p) => query_interface::execute_query_with_params(&mut db, &req.query, p),
+                None => query_interface::execute_and_log(&mut db, &req.query),
+            };
+            let dt = t0.elapsed();
+            
+            let mutated = res.as_ref().map(|o| o.mutated).unwrap_or(false);
+            if mutated {
+                dirty = true;
+            }
+
+            eprintln!(
+                "[API Background] RID={} done mutated={} dt_ms={}",
+                req.request_id,
+                mutated,
+                dt.as_millis()
+            );
+            let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
+        }
     }
 }

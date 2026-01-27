@@ -71,15 +71,29 @@ fn main() {
     let quiet = matches.get_flag("quiet");
 
     let endpoint = format!("ws://{}:{}/api/repl", host, port);
-    let url = Url::parse(&endpoint).expect("invalid URL");
-
-    // Prepare request with optional header
-    let mut req = url.into_client_request().expect("request");
+    let url = match Url::parse(&endpoint) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid URL '{}': {}", endpoint, e);
+            std::process::exit(1);
+        }
+    };
+    let mut req = match url.into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("failed to create client request: {}", e);
+            std::process::exit(1);
+        }
+    };
     if let Some(key) = api_key {
-        req.headers_mut().insert(
-            "X-API-Key",
-            http::HeaderValue::from_str(&key).expect("invalid api key header value"),
-        );
+        let val = match http::HeaderValue::from_str(&key) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("invalid api key header value: {}", e);
+                std::process::exit(1);
+            }
+        };
+        req.headers_mut().insert("X-API-Key", val);
     }
 
     let (mut socket, _resp) = match connect(req) {
@@ -131,7 +145,13 @@ fn main() {
     }
 
     // Interactive mode with history
-    let mut rl: Editor<(), DefaultHistory> = Editor::new().expect("init editor");
+    let mut rl: Editor<(), DefaultHistory> = match Editor::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to initialize editor: {}", e);
+            std::process::exit(1);
+        }
+    };
     let mut hist_path = settings_dir();
     hist_path.push("glsh_history.txt");
     // Load history if present

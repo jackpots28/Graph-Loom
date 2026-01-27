@@ -59,6 +59,7 @@ tonic = { version = "0.12", optional = true }
 prost = { version = "0.13", optional = true }
 prost-derive = { version = "0.13", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
+tray-icon = "0.19"
 
 [build-dependencies]
 tonic-build = "0.12"

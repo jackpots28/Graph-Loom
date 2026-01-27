@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Runtime;
 
 use super::{get_request_sender, ApiRequest};
 use crate::gql::query_interface::{QueryOutcome, QueryResultRow};
@@ -14,10 +15,11 @@ use crate::persistence::settings::AppSettings;
 // Store server state for stop/restart
 struct ServerState {
     handle: Option<actix_web::dev::ServerHandle>,
+    runtime: Option<Runtime>,
 }
 
 static SERVER_STATE: once_cell::sync::Lazy<Arc<Mutex<ServerState>>> = once_cell::sync::Lazy::new(|| {
-    Arc::new(Mutex::new(ServerState { handle: None }))
+    Arc::new(Mutex::new(ServerState { handle: None, runtime: None }))
 });
 
 static REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -142,7 +144,6 @@ async fn handle_query(cfg: web::Data<Cfg>, req: HttpRequest, body: web::Json<Que
     let (tx, rx) = std::sync::mpsc::channel();
     let rid = next_request_id();
     let api_req = ApiRequest {
-        api_key: cfg.api_key.clone(),
         request_id: rid.clone(),
         query: body.query.clone(),
         params: body.params.clone(),
@@ -201,7 +202,7 @@ impl actix::StreamHandler<Result<ws::Message, ws::ProtocolError>> for ReplWs {
                 let rid = next_request_id();
                 log_line(&self.cfg.log_dir, &format!("RID={} WS query qlen={}", rid, q.len()));
                 let (tx, rx) = std::sync::mpsc::channel();
-                let req = ApiRequest { api_key: self.cfg.api_key.clone(), request_id: rid.clone(), query: q, params: None, log: true, respond_to: tx };
+                let req = ApiRequest { request_id: rid.clone(), query: q, params: None, log: true, respond_to: tx };
                 let t0 = std::time::Instant::now();
                 if sender.send(req).is_err() { ctx.text("enqueue failed"); return; }
                 match rx.recv_timeout(Duration::from_secs(60)) {
@@ -240,35 +241,60 @@ pub fn start_server(cfg: &AppSettings) -> anyhow::Result<()> {
     let _ = super::grpc::start_grpc_server(cfg);
 
     std::thread::spawn(move || {
-        let sys = actix_web::rt::System::new();
-        sys.block_on(async move {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[Graph-Loom] Failed to create tokio runtime for API: {}", e);
+                    return;
+                }
+            };
+        
+        rt.block_on(async move {
             let cfg_data = Cfg { api_key, log_dir: log_dir.clone() };
             log_line(&cfg_data.log_dir, &format!("Server starting on {}", bind));
-            let server = HttpServer::new(move || {
+            let server = match HttpServer::new(move || {
                 App::new()
                     .app_data(web::Data::new(cfg_data.clone()))
                     .route("/api/query", web::post().to(handle_query))
                     .route("/api/repl", web::get().to(ws_handler))
             })
-            .bind(bind)
-            .expect("bind failed")
-            .run();
+            .bind(&bind) {
+                Ok(s) => s.run(),
+                Err(e) => {
+                    eprintln!("[Graph-Loom] API server bind failed on {}: {}", bind, e);
+                    return;
+                }
+            };
             {
                 let mut st = SERVER_STATE.lock().unwrap();
                 st.handle = Some(server.handle());
             }
             let _ = server.await;
         });
+        {
+            let mut st = SERVER_STATE.lock().unwrap();
+            st.runtime = Some(rt);
+        }
     });
     Ok(())
 }
 
 pub fn stop_server() {
-    if let Some(handle) = SERVER_STATE.lock().unwrap().handle.take() {
-        // trigger stop (graceful=false)
-        let _ = handle.stop(false);
+    let (handle, rt) = {
+        let mut st = SERVER_STATE.lock().unwrap();
+        (st.handle.take(), st.runtime.take())
+    };
+    if let Some(h) = handle {
+        let _ = h.stop(false);
+    }
+    if let Some(r) = rt {
+        r.shutdown_timeout(Duration::from_millis(100));
     }
     super::grpc::stop_grpc_server();
 }
 
+#[allow(dead_code)]
 pub fn is_running() -> bool { SERVER_STATE.lock().unwrap().handle.is_some() }

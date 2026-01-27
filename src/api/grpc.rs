@@ -39,7 +39,6 @@ impl GraphQuery for MyGraphQuery {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let api_req = ApiRequest {
-            api_key: self.api_key.clone(),
             request_id: format!("grpc-{}", uuid::Uuid::now_v7()),
             query: req.query.clone(),
             params: Some(req.params),
@@ -100,11 +99,12 @@ impl GraphQuery for MyGraphQuery {
 
 struct GrpcServerState {
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 static GRPC_SERVER_STATE: once_cell::sync::Lazy<Arc<Mutex<GrpcServerState>>> =
     once_cell::sync::Lazy::new(|| {
-        Arc::new(Mutex::new(GrpcServerState { shutdown_tx: None }))
+        Arc::new(Mutex::new(GrpcServerState { shutdown_tx: None, runtime: None }))
     });
 
 pub fn start_grpc_server(cfg: &AppSettings) -> anyhow::Result<()> {
@@ -124,24 +124,46 @@ pub fn start_grpc_server(cfg: &AppSettings) -> anyhow::Result<()> {
     }
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[Graph-Loom] Failed to create tokio runtime for gRPC: {}", e);
+                    return;
+                }
+            };
+
         rt.block_on(async {
             let service = MyGraphQuery { api_key };
-            let _ = Server::builder()
+            if let Err(e) = Server::builder()
                 .add_service(GraphQueryServer::new(service))
                 .serve_with_shutdown(addr, async {
                     let _ = rx.await;
                 })
-                .await;
+                .await {
+                    eprintln!("[Graph-Loom] gRPC server failed: {}", e);
+                }
         });
+        {
+            let mut state = GRPC_SERVER_STATE.lock().unwrap();
+            state.runtime = Some(rt);
+        }
     });
 
     Ok(())
 }
 
 pub fn stop_grpc_server() {
-    let mut state = GRPC_SERVER_STATE.lock().unwrap();
-    if let Some(tx) = state.shutdown_tx.take() {
+    let (shutdown_tx, rt) = {
+        let mut state = GRPC_SERVER_STATE.lock().unwrap();
+        (state.shutdown_tx.take(), state.runtime.take())
+    };
+    if let Some(tx) = shutdown_tx {
         let _ = tx.send(());
+    }
+    if let Some(r) = rt {
+        r.shutdown_timeout(std::time::Duration::from_millis(100));
     }
 }

@@ -34,6 +34,20 @@ impl AppStateFile {
         }
     }
 
+    /// Create from runtime components without cloning the database if possible.
+    pub fn from_runtime_owned(db: GraphDatabase, node_positions: &HashMap<NodeId, egui::Pos2>, pan: egui::Vec2, zoom: f32) -> Self {
+        let node_positions = node_positions
+            .iter()
+            .map(|(id, pos)| (*id, pos.x, pos.y))
+            .collect();
+        Self {
+            db,
+            node_positions,
+            pan: (pan.x, pan.y),
+            zoom,
+        }
+    }
+
     /// Convert a persisted AppStateFile into runtime structures.
     ///
     /// This intentionally consumes `self` to avoid cloning large buffers.
