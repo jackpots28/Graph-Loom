@@ -1111,7 +1111,7 @@ impl eframe::App for GraphApp {
 
                 let ctx_clone = ctx.clone();
                 std::thread::spawn(move || {
-                    for i in 1..=10 {
+                    for i in 1..=30 {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -1120,11 +1120,11 @@ impl eframe::App for GraphApp {
                         crate::gui::win_utils::force_foreground_window();
 
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        if i % 4 == 0 {
+                        if i % 5 == 0 {
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                         }
-                        if i == 8 {
+                        if i == 25 {
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                         }
                         ctx_clone.request_repaint();

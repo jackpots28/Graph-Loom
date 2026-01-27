@@ -158,6 +158,11 @@ fn main() -> eframe::Result {
                 loop {
                     if let Ok(event) = menu_channel.try_recv() {
                         if event.id == show_item_id {
+                            #[cfg(target_os = "windows")]
+                            unsafe {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows::Win32::UI::WindowsAndMessaging::ASFW_ANY);
+                            }
+
                             crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
                             
                             // Send multiple commands to ensure visibility and focus
@@ -176,7 +181,7 @@ fn main() -> eframe::Result {
                             std::thread::spawn(move || {
                                 // Assert focus and level multiple times over a short period
                                 // Increasing attempts and duration for better reliability on Windows
-                                for i in 1..=10 {
+                                for i in 1..=40 {
                                     std::thread::sleep(std::time::Duration::from_millis(200));
                                     
                                     // Continually re-assert visibility and non-minimized state
@@ -189,13 +194,13 @@ fn main() -> eframe::Result {
                                     // Multi-pronged focus assertion
                                     ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
                                     
-                                    if i % 4 == 0 {
+                                    if i % 5 == 0 {
                                         // Pulse AlwaysOnTop and RequestAttention to break through OS focus prevention
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                                     }
                                     
-                                    if i == 8 {
+                                    if i == 35 {
                                         // Return to normal level
                                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                                     }
