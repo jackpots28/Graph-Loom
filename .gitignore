@@ -9,4 +9,7 @@
 /assets
 /assets/logs
 
+/WindowsInstaller/icon
+/WindowsInstaller/output
+
 CypherStyleSpec.md
