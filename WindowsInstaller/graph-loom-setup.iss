@@ -5,7 +5,7 @@
 #define MyAppVersion "1.9.2"
 #define MyAppPublisher "jackpots28"
 #define MyAppURL "https://github.com/jackpots28"
-#define MyAppExeName "graph-loom.exe"
+#define MyAppExeName "Graph-Loom.exe"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application.
@@ -61,4 +61,39 @@ Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#MyAppName}"; Fil
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-// Custom code can be added here if needed for special installation logic
+function GetUninstallString(): String;
+var
+  sUnInstPath: String;
+  sUnInstallString: String;
+begin
+  sUnInstPath := ExpandConstant('Software\Microsoft\Windows\CurrentVersion\Uninstall\{#emit SetupSetting("AppId")}_is1');
+  sUnInstallString := '';
+  if not RegQueryStringValue(HKLM, sUnInstPath, 'UninstallString', sUnInstallString) then
+    RegQueryStringValue(HKCU, sUnInstPath, 'UninstallString', sUnInstallString);
+  Result := sUnInstallString;
+end;
+
+function IsUpgrade(): Boolean;
+begin
+  Result := (GetUninstallString() <> '');
+end;
+
+function InitializeSetup(): Boolean;
+var
+  V: Integer;
+  iResultCode: Integer;
+  sUnInstallString: String;
+begin
+  Result := True;
+  if IsUpgrade() then
+  begin
+    V := MsgBox(ExpandConstant('An existing installation of {#MyAppName} was detected. Do you want to uninstall it before continuing?'), mbConfirmation, MB_YESNO);
+    if V = IDYES then
+    begin
+      sUnInstallString := GetUninstallString();
+      sUnInstallString := RemoveQuotes(sUnInstallString);
+      Exec(sUnInstallString, '/SILENT /VERYSILENT /NORESTART /SUPPRESSMSGBOXES', '', SW_SHOW, ewWaitUntilTerminated, iResultCode);
+      Result := True; // Continue with installation
+    end;
+  end;
+end;

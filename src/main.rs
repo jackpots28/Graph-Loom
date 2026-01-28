@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod gql;
 mod graph_utils;
 mod gui;
@@ -20,6 +20,13 @@ use tray_icon::{
 use std::sync::atomic::Ordering;
 
 fn main() -> eframe::Result {
+    {
+        if let Some(pid) = gui::win_utils::find_running_instance() {
+            gui::win_utils::force_foreground_process(pid);
+            return Ok(());
+        }
+    }
+
     #[cfg(feature = "api")]
     let mut background_mode = false;
 
@@ -78,9 +85,20 @@ fn main() -> eframe::Result {
     // If background_on_close is enabled and we have a server that could run,
     // start hidden by default on consecutive runs.
     #[cfg(feature = "api")]
-    if settings.background_on_close && (settings.api_enabled || settings.grpc_enabled) {
-        crate::gui::app_state::SHOW_WINDOW.store(false, Ordering::SeqCst);
+    {
+        if settings.background_on_close && (settings.api_enabled || settings.grpc_enabled) {
+            crate::gui::app_state::SHOW_WINDOW.store(false, Ordering::SeqCst);
+        } else {
+            crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
+        }
     }
+
+    #[cfg(not(feature = "api"))]
+    crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
+
+    // Ensure LAST_SHOW_WINDOW matches initial state
+    // We can't easily access LAST_SHOW_WINDOW from here as it is inside GraphApp::update,
+    // but its default is true, so it will trigger if we start false.
 
     let icon_bytes = include_bytes!("../assets/AppSet.iconset/icon_512x512.png");
     let icon = match eframe::icon_data::from_png_bytes(icon_bytes) {
@@ -145,15 +163,33 @@ fn main() -> eframe::Result {
             std::thread::spawn(move || {
                 let menu_channel = MenuEvent::receiver();
                 loop {
-                    if let Ok(event) = menu_channel.try_recv() {
+                    if let Ok(event) = menu_channel.recv() {
                         if event.id == show_item_id {
+                            #[cfg(target_os = "windows")]
+                            unsafe {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows::Win32::UI::WindowsAndMessaging::ASFW_ANY);
+                            }
+
                             crate::gui::app_state::SHOW_WINDOW.store(true, Ordering::SeqCst);
+                            
+                            // Send multiple commands to ensure visibility and focus
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            
+                            // Use Win32 API to force foreground on Windows
+                            crate::gui::win_utils::force_foreground_window();
+
+                            // Repaint to ensure viewport commands are processed
                             ctx.request_repaint();
+                            
+                            // Reset window level after a delay, but also re-assert focus
+                            // We now rely on GraphApp's update loop to handle the persistent restoration cycle
+                            // by reacting to the SHOW_WINDOW state change.
                         } else if event.id == quit_item_id {
                             std::process::exit(0);
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             });
 
@@ -210,29 +246,6 @@ fn run_background(settings: persistence::settings::AppSettings) -> eframe::Resul
     let mut dirty = false;
 
     loop {
-        // Process API requests
-        while let Ok(req) = rx.try_recv() {
-            let t0 = Instant::now();
-            let res = match &req.params {
-                Some(p) => query_interface::execute_query_with_params(&mut db, &req.query, p),
-                None => query_interface::execute_and_log(&mut db, &req.query),
-            };
-            let dt = t0.elapsed();
-            
-            let mutated = res.as_ref().map(|o| o.mutated).unwrap_or(false);
-            if mutated {
-                dirty = true;
-            }
-
-            eprintln!(
-                "[API Background] RID={} done mutated={} dt_ms={}",
-                req.request_id,
-                mutated,
-                dt.as_millis()
-            );
-            let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
-        }
-
         // Periodic save
         if dirty && last_save.elapsed() > Duration::from_secs(5) {
             // Note: in background mode, db is local so we can use it to create owned state
@@ -251,7 +264,7 @@ fn run_background(settings: persistence::settings::AppSettings) -> eframe::Resul
             }
         }
 
-        // Use recv_timeout to wait for requests instead of busy-sleep
+        // Use recv_timeout to wait for requests instead of busy-looping
         if let Ok(req) = rx.recv_timeout(Duration::from_millis(500)) {
             let t0 = Instant::now();
             let res = match &req.params {

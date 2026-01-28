@@ -36,15 +36,28 @@ cargo build --features cli --bin glsh
 ### Prerequisites
 - [Rust toolchain](https://www.rust-lang.org/tools/install) (stable)
 
-### Build and Run
+### Build and Run (Standard)
 ```bash
 cargo run --release
 ```
 
+### Windows Optimized Build (GUI + CLI)
+To build both the main application and the CLI shell with release optimizations:
+```bash
+cargo build --profile release --features cli --bin glsh --bin Graph-Loom
+```
+
 ### Headless Background Mode
+Run as a pure API server without a GUI:
 ```bash
 ./target/release/Graph-Loom --background --api-enable
 ```
+
+## Backgrounding & Multi-Instance behavior (Windows)
+
+- **Close to Tray:** If API/gRPC is enabled, closing the window will hide it to the system tray while keeping the service running. Use the tray icon to "Show" or "Quit".
+- **Multi-Instance Detection:** Attempting to start a second instance of Graph-Loom will automatically bring the already running instance to the foreground.
+- **CPU Efficiency:** The app is optimized to consume near-zero CPU cycles when running in the background.
 
 ## Using the App
 

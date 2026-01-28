@@ -322,6 +322,9 @@ pub struct GraphApp {
     // API server runtime
     api_rx: Option<Receiver<ApiRequest>>,
     api_running: bool,
+    // Prevention for immediate re-open loop
+    last_background_time: Option<Instant>,
+    first_focused_observed: Option<Instant>,
 }
 
 impl GraphApp {
@@ -422,6 +425,8 @@ impl GraphApp {
             prefs_api_log_override_str: String::new(),
             api_rx: None,
             api_running: false,
+            last_background_time: None,
+            first_focused_observed: None,
         };
         // Apply settings to runtime toggles
         s.lod_enabled = s.app_settings.lod_enabled;
@@ -911,6 +916,8 @@ impl GraphApp {
             prefs_api_log_override_str: String::new(),
             api_rx: None,
             api_running: false,
+            last_background_time: None,
+            first_focused_observed: None,
         };
         // Apply settings to runtime toggles
         s.lod_enabled = s.app_settings.lod_enabled;
@@ -1083,20 +1090,136 @@ impl GraphApp {
 
 impl eframe::App for GraphApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Detect if the window was shown externally (e.g. by another instance using Win32 API)
+        if !crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
+            let cooldown_passed = self.last_background_time
+                .map(|t| t.elapsed() > Duration::from_secs(2))
+                .unwrap_or(true);
+
+            if cooldown_passed && ctx.input(|i| i.viewport().focused == Some(true)) {
+                // Double check focus over 100ms to avoid transient reports during backgrounding
+                match self.first_focused_observed {
+                    Some(t) if t.elapsed() >= Duration::from_millis(100) => {
+                        crate::gui::app_state::SHOW_WINDOW.store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.first_focused_observed = None;
+                    }
+                    Some(_) => {
+                        // Still waiting for 100ms to pass
+                        ctx.request_repaint(); // Keep checking
+                    }
+                    None => {
+                        self.first_focused_observed = Some(Instant::now());
+                        ctx.request_repaint();
+                    }
+                }
+            } else {
+                self.first_focused_observed = None;
+            }
+        } else {
+            self.first_focused_observed = None;
+        }
+
         // Handle window close event for backgrounding
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.app_settings.background_on_close && (self.app_settings.api_enabled || self.app_settings.grpc_enabled) {
                 // Use the static from gui::app_state
                 crate::gui::app_state::SHOW_WINDOW.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.last_background_time = Some(Instant::now());
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
 
         // Handle window visibility and background mode
-        if !crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        } else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        let show_window = crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
+        static LAST_SHOW_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if show_window != LAST_SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
+            if show_window {
+                // RESTORING from background
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                // Also request attention when showing from internal state change
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+                // Briefly set AlwaysOnTop here too to be safe
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+
+                // Use Win32 API to force foreground on Windows
+                crate::gui::win_utils::force_foreground_window();
+
+                let ctx_clone = ctx.clone();
+                std::thread::spawn(move || {
+                    for i in 1..=5 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        
+                        // If the user has hidden the window again during this loop, stop immediately
+                        if !crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+                            break;
+                        }
+
+                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        
+                        // Use Win32 API to force foreground on Windows
+                        #[cfg(target_os = "windows")]
+                        unsafe {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows::Win32::UI::WindowsAndMessaging::ASFW_ANY);
+                        }
+                        crate::gui::win_utils::force_foreground_window();
+
+                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
+
+                        // Double check after commands
+                        if !crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+                            break;
+                        }
+
+                        if i % 2 == 0 {
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+                        }
+                        if i == 4 {
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+                        }
+                        ctx_clone.request_repaint();
+                    }
+                });
+            } else {
+                // GOING to background
+                // On Windows, if we want the app icon to STAY in the taskbar but the window to be hidden,
+                // Minimized(true) is often better than Visible(false).
+                // However, the user said "The app icon on the taskbar also does not return as it should",
+                // implying it DOES leave the taskbar (which is what we want for "background mode").
+                // If we use Visible(false), it leaves the taskbar. 
+                // To make it come back, we MUST use Visible(true).
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            LAST_SHOW_WINDOW.store(show_window, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        if !show_window {
+            // When hidden, we don't need to update the UI at all.
+            // But we might still need to process API requests.
+            if let Some(rx) = &self.api_rx {
+                if let Ok(req) = rx.recv_timeout(Duration::from_millis(500)) {
+                    // Execute query on GUI thread
+                    let res = match &req.params {
+                        Some(p) => query_interface::execute_query_with_params(&mut self.db, &req.query, p),
+                        None => query_interface::execute_and_log(&mut self.db, &req.query),
+                    };
+                    let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
+                    
+                    // If we mutated the DB, we might want to save eventually.
+                    // But we don't need to repaint the UI.
+                }
+            } else {
+                // No API, just sleep
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            // Ask egui to wake us up later, or when there is input (though there shouldn't be when hidden)
+            ctx.request_repaint_after(Duration::from_millis(500));
+            return;
         }
 
     // Process pending API requests (execute queries on the GUI thread safely)
