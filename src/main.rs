@@ -163,7 +163,7 @@ fn main() -> eframe::Result {
             std::thread::spawn(move || {
                 let menu_channel = MenuEvent::receiver();
                 loop {
-                    if let Ok(event) = menu_channel.try_recv() {
+                    if let Ok(event) = menu_channel.recv() {
                         if event.id == show_item_id {
                             #[cfg(target_os = "windows")]
                             unsafe {
@@ -184,42 +184,12 @@ fn main() -> eframe::Result {
                             ctx.request_repaint();
                             
                             // Reset window level after a delay, but also re-assert focus
-                            let ctx_clone = ctx.clone();
-                            std::thread::spawn(move || {
-                                // Assert focus and level multiple times over a short period
-                                // Increasing attempts and duration for better reliability on Windows
-                                for i in 1..=40 {
-                                    std::thread::sleep(std::time::Duration::from_millis(200));
-                                    
-                                    // Continually re-assert visibility and non-minimized state
-                                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                                    
-                                    // Use Win32 API to force foreground on Windows
-                                    crate::gui::win_utils::force_foreground_window();
-
-                                    // Multi-pronged focus assertion
-                                    ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
-                                    
-                                    if i % 5 == 0 {
-                                        // Pulse AlwaysOnTop and RequestAttention to break through OS focus prevention
-                                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-                                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
-                                    }
-                                    
-                                    if i == 35 {
-                                        // Return to normal level
-                                        ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
-                                    }
-                                    
-                                    ctx_clone.request_repaint();
-                                }
-                            });
+                            // We now rely on GraphApp's update loop to handle the persistent restoration cycle
+                            // by reacting to the SHOW_WINDOW state change.
                         } else if event.id == quit_item_id {
                             std::process::exit(0);
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             });
 
@@ -276,29 +246,6 @@ fn run_background(settings: persistence::settings::AppSettings) -> eframe::Resul
     let mut dirty = false;
 
     loop {
-        // Process API requests
-        while let Ok(req) = rx.try_recv() {
-            let t0 = Instant::now();
-            let res = match &req.params {
-                Some(p) => query_interface::execute_query_with_params(&mut db, &req.query, p),
-                None => query_interface::execute_and_log(&mut db, &req.query),
-            };
-            let dt = t0.elapsed();
-            
-            let mutated = res.as_ref().map(|o| o.mutated).unwrap_or(false);
-            if mutated {
-                dirty = true;
-            }
-
-            eprintln!(
-                "[API Background] RID={} done mutated={} dt_ms={}",
-                req.request_id,
-                mutated,
-                dt.as_millis()
-            );
-            let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
-        }
-
         // Periodic save
         if dirty && last_save.elapsed() > Duration::from_secs(5) {
             // Note: in background mode, db is local so we can use it to create owned state
@@ -317,7 +264,7 @@ fn run_background(settings: persistence::settings::AppSettings) -> eframe::Resul
             }
         }
 
-        // Use recv_timeout to wait for requests instead of busy-sleep
+        // Use recv_timeout to wait for requests instead of busy-looping
         if let Ok(req) = rx.recv_timeout(Duration::from_millis(500)) {
             let t0 = Instant::now();
             let res = match &req.params {
