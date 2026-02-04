@@ -1,5 +1,9 @@
 /target
 /.idea
+/examples/python_client/.idea
+*.ipynb
+*__pycache__*
+
 !/assets/.gitkeep
 !/assets/logs/.gitkeep
 !/assets/AppSet.iconset/.gitkeep
