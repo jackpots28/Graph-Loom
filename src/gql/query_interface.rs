@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use time::{macros::format_description, OffsetDateTime};
 use uuid::Uuid;
+use rayon::prelude::*;
 
 use crate::graph_utils::graph::{GraphDatabase, NodeId};
 use super::cypher_spec::{execute_cypher, execute_cypher_with_params};
@@ -52,26 +53,51 @@ fn log_query(query: &str, outcome: &Result<QueryOutcome>) {
 }
 
 fn _split_statements(input: &str) -> Vec<String> {
-    // Primary split by ';'. Additionally, split when a new line starts with a Cypher keyword (CREATE/MATCH/OPTIONAL MATCH/MERGE/RETURN/DELETE/DETACH DELETE)
-    // This allows multi-line separate statements without semicolons, while preserving multi-line bodies like CREATE with patterns on following lines.
-    let mut parts: Vec<String> = Vec::new();
-    for chunk in input.split(';') {
-        let mut acc = String::new();
-        for line in chunk.lines() {
-            let trimmed = line.trim_start();
-            let up = trimmed.to_uppercase();
-            let is_keyword_line = up.starts_with("CREATE") || up.starts_with("MATCH ") || up.starts_with("OPTIONAL MATCH ") || up.starts_with("MERGE ") || up.starts_with("RETURN ") || up.starts_with("DETACH DELETE ") || up.starts_with("DELETE ");
-            if is_keyword_line && !acc.trim().is_empty() {
-                // start a new statement
-                parts.push(acc.trim().to_string());
-                acc = String::new();
+    // Primary split by ';'. We avoid splitting if the semicolon is inside quotes or braces.
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = None;
+    let mut brace_depth: i32 = 0;
+    
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' | '\'' => {
+                if in_quote == Some(c) {
+                    in_quote = None;
+                } else if in_quote.is_none() {
+                    in_quote = Some(c);
+                }
+                current.push(c);
             }
-            if !acc.is_empty() { acc.push('\n'); }
-            acc.push_str(line);
+            '{' | '(' | '[' if in_quote.is_none() => {
+                brace_depth += 1;
+                current.push(c);
+            }
+            '}' | ')' | ']' if in_quote.is_none() => {
+                brace_depth = brace_depth.saturating_sub(1);
+                current.push(c);
+            }
+            ';' if in_quote.is_none() && brace_depth == 0 => {
+                let s = current.trim().to_string();
+                if !s.is_empty() {
+                    statements.push(s);
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
         }
-        if !acc.trim().is_empty() { parts.push(acc.trim().to_string()); }
+        i += 1;
     }
-    parts.into_iter().filter(|s| !s.trim().is_empty()).collect()
+    let s = current.trim().to_string();
+    if !s.is_empty() {
+        statements.push(s);
+    }
+    statements
 }
 
 pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome> {
@@ -83,19 +109,26 @@ pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome
     // We allow multiple statements separated by semicolons; execute sequentially
     let mut outcome = QueryOutcome::default();
     let mut any_mut = false;
-    for stmt in trimmed.split(';') {
+    let statements = _split_statements(trimmed);
+    for stmt in statements {
         let stmt = stmt.trim();
         if stmt.is_empty() { continue; }
         let upper = stmt.to_uppercase();
-        // First: legacy minimal Cypher-style handler for pairwise MATCH...MERGE in one statement
+        println!("DEBUG: Executing statement: [{}]", stmt);
         let res = if upper.starts_with("MATCH (") && upper.contains(" MERGE ") {
             // Legacy minimal Cypher-style pairwise support (kept for compatibility)
             exec_cypher_match_merge(db, stmt)
         // If the statement appears to be OpenCypher, route to the Cypher engine.
         // Detect by keywords and forms that are NOT the legacy custom commands.
-        } else if (upper.starts_with("MATCH ") && stmt[6..].trim_start().starts_with('(')) ||
-        // OPTIONAL MATCH with '(' only
-        (upper.starts_with("OPTIONAL MATCH ") && stmt[15..].trim_start().starts_with('(')) ||
+        } else if (upper.starts_with("MATCH") && (stmt[5..].trim_start().starts_with('(') || stmt[5..].trim_start().starts_with("(") || (stmt[5..].trim_start().contains('.') && !stmt[5..].trim_start().starts_with("NODE ") && !stmt[5..].trim_start().starts_with("REL ")))) ||
+        // WITH is Cypher-only
+        upper.starts_with("WITH ") ||
+        // UNWIND is Cypher-only
+        upper.starts_with("UNWIND ") ||
+        // DETACH DELETE is Cypher-only
+        upper.starts_with("DETACH DELETE ") ||
+        // OPTIONAL MATCH with '(' or shorthand
+        (upper.starts_with("OPTIONAL MATCH ") && (stmt[15..].trim_start().starts_with('(') || (stmt[15..].trim_start().contains('.') && !stmt[15..].trim_start().starts_with("NODE ") && !stmt[15..].trim_start().starts_with("REL ")))) ||
         // MERGE is Cypher-only
         upper.starts_with("MERGE ") ||
         // RETURN is Cypher-only
@@ -106,15 +139,18 @@ pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome
         (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL ")) ||
         upper.starts_with("DETACH DELETE ") ||
         // CREATE with '(' pattern (avoid legacy CREATE NODE/REL)
-        (upper.starts_with("CREATE") && stmt[6..].trim_start().starts_with('(')) {
+        (upper.starts_with("CREATE") && stmt[6..].trim_start().starts_with('(')) ||
+        // Catch-all for multi-clause queries
+        (upper.contains("WITH ") && (upper.contains("MATCH ") || upper.contains("RETURN "))) ||
+        (upper.contains("UNWIND ") && upper.contains("WITH ")) {
             let rows = execute_cypher(db, stmt)?;
-            // conservatively mark mutated if statement starts with CREATE or MERGE
-            let mutated = upper.starts_with("CREATE")
-                || upper.starts_with("MERGE ")
-                || upper.starts_with("SET ")
-                || upper.starts_with("REMOVE ")
-                || (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL "))
-                || upper.starts_with("DETACH DELETE ");
+            // conservatively mark mutated if statement contains mutating keywords
+            let mutated = upper.contains("CREATE")
+                || upper.contains("MERGE")
+                || upper.contains("SET ")
+                || upper.contains("REMOVE ")
+                || upper.contains("DELETE")
+                || upper.contains("DETACH DELETE");
             Ok((rows, 0, 0, mutated))
         } else if upper.starts_with("CREATE NODE ") {
             exec_create_node(db, &stmt[12..])
@@ -168,20 +204,24 @@ pub fn execute_query_with_params(
         let stmt = stmt.trim();
         if stmt.is_empty() { continue; }
         let upper = stmt.to_uppercase();
-        // First: legacy minimal Cypher-style handler for pairwise MATCH...MERGE
-        let res = if upper.starts_with("MATCH (") && upper.contains(" MERGE ") {
-            exec_cypher_match_merge(db, stmt)
-        // True Cypher engine path
-        } else if (upper.starts_with("MATCH ") && stmt[6..].trim_start().starts_with('(')) ||
-        (upper.starts_with("OPTIONAL MATCH ") && stmt[15..].trim_start().starts_with('(')) ||
-        upper.starts_with("MERGE ") ||
-        upper.starts_with("RETURN ") ||
-        (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL ")) ||
-        upper.starts_with("DETACH DELETE ") ||
-        (upper.starts_with("CREATE ") && stmt[7..].trim_start().starts_with('(')) {
+
+        // Check if it's a "standard" Cypher query
+        let is_cypher = (upper.starts_with("MATCH ") && stmt[6..].trim_start().starts_with('(')) ||
+            (upper.starts_with("OPTIONAL MATCH ") && stmt[15..].trim_start().starts_with('(')) ||
+            upper.starts_with("MERGE ") ||
+            upper.starts_with("RETURN ") ||
+            (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL ")) ||
+            upper.starts_with("DETACH DELETE ") ||
+            (upper.starts_with("CREATE ") && stmt[7..].trim_start().starts_with('('));
+
+        let res = if is_cypher {
             let rows = execute_cypher_with_params(db, stmt, params)?;
-            let mutated = upper.starts_with("CREATE ") || upper.starts_with("MERGE ") || (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL ")) || upper.starts_with("DETACH DELETE ");
+            let mutated = upper.starts_with("CREATE ") || upper.starts_with("MERGE ") || 
+                (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL ")) || 
+                upper.starts_with("DETACH DELETE ");
             Ok((rows, 0, 0, mutated))
+        } else if upper.starts_with("MATCH (") && upper.contains(" MERGE ") {
+            exec_cypher_match_merge(db, stmt)
         } else if upper.starts_with("CREATE NODE ") {
             exec_create_node(db, &stmt[12..])
         } else if upper.starts_with("CREATE REL ") {
@@ -195,7 +235,12 @@ pub fn execute_query_with_params(
         } else if upper.starts_with("DELETE REL ") {
             exec_delete_rel(db, &stmt[11..]).map(|cnt| (Vec::new(), 0, cnt, true))
         } else {
-            return Err(anyhow!("unrecognized statement: {}", stmt));
+            // Default to Cypher engine if it doesn't match legacy custom commands
+            let rows = execute_cypher_with_params(db, stmt, params)?;
+            let mutated = upper.starts_with("CREATE ") || upper.starts_with("MERGE ") || 
+                (upper.starts_with("DELETE ") && !upper.starts_with("DELETE NODE ") && !upper.starts_with("DELETE REL ")) || 
+                upper.starts_with("DETACH DELETE ");
+            Ok((rows, 0, 0, mutated))
         }?;
 
         let (rows, n_cnt, r_cnt, mutated) = res;
@@ -583,7 +628,7 @@ fn exec_match_node(db: &GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow
     // Apply WHERE conditions, if any
     let conds = if let Some(ws) = where_clause { parse_where_conds(&ws)? } else { Vec::new() };
     if !conds.is_empty() {
-        ids.retain(|id| {
+        ids = ids.into_par_iter().filter(|id| {
             if let Some(n) = db.get_node(*id) {
                 for c in &conds {
                     match c {
@@ -598,7 +643,7 @@ fn exec_match_node(db: &GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow
                 }
                 true
             } else { false }
-        });
+        }).collect();
     }
     let mut rows = Vec::with_capacity(ids.len());
     for id in ids {
@@ -621,7 +666,7 @@ fn exec_match_rel(db: &GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow>
     }
     let conds = if let Some(ws) = where_clause { parse_where_conds(&ws)? } else { Vec::new() };
     if !conds.is_empty() {
-        ids.retain(|rid| {
+        ids = ids.into_par_iter().filter(|rid| {
             if let Some(r) = db.get_relationship(*rid) {
                 for c in &conds {
                     match c {
@@ -636,7 +681,7 @@ fn exec_match_rel(db: &GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow>
                 }
                 true
             } else { false }
-        });
+        }).collect();
     }
     let mut rows = Vec::with_capacity(ids.len());
     for rid in ids {

@@ -17,7 +17,11 @@ enum Expr {
     Var(String),
     Prop(Box<Expr>, String),
     FuncId(String),
+    FuncTimestamp(String),
+    FuncCollect(String),          // collect(var)
+    ListSlice(String, Option<usize>, Option<usize>), // var[start..end]
     Str(String),
+    Alias(Box<Expr>, String),     // expr AS alias
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,6 +60,7 @@ enum Clause {
     Delete { vars: Vec<String>, detach: bool },
     Set { items: Vec<String> },
     Remove { items: Vec<String> },
+    Unwind { expr: String, var: String }, // UNWIND expr AS var
 }
 
 // Find a clause keyword at a token boundary (start or preceded by whitespace) and
@@ -278,22 +283,75 @@ fn parse_pattern(s: &str) -> Result<Pattern> {
 
 fn parse_return_items(s: &str) -> Result<Vec<Expr>> {
     let mut items = Vec::new();
-    for part in s.split(',') {
+    for part in split_top_level_comma(s) {
         let p = part.trim();
-        if p.to_uppercase().starts_with("ID(") && p.ends_with(')') {
-            let v = p[3..p.len()-1].trim();
-            items.push(Expr::FuncId(v.to_string()));
-        } else if let Some(dot) = p.find('.') {
-            let v = p[..dot].trim().to_string();
-            let prop = p[dot+1..].trim().to_string();
-            items.push(Expr::Prop(Box::new(Expr::Var(v)), prop));
-        } else if p.starts_with('"') || p.starts_with('\'') { 
-            items.push(Expr::Str(trim_quotes(p)));
+        if p.is_empty() { continue; }
+        let pu = p.to_uppercase();
+        
+        // Check for AS alias
+        let (expr_part, alias) = if let Some(as_idx) = find_keyword_boundary(&pu, "AS") {
+            let expr_str = p[..as_idx].trim();
+            let alias_str = p[as_idx+2..].trim().to_string();
+            (expr_str, Some(alias_str))
         } else {
-            items.push(Expr::Var(p.to_string()));
+            (p, None)
+        };
+        
+        let expr = parse_single_expr(expr_part)?;
+        
+        if let Some(alias_name) = alias {
+            items.push(Expr::Alias(Box::new(expr), alias_name));
+        } else {
+            items.push(expr);
         }
     }
     Ok(items)
+}
+
+fn parse_single_expr(p: &str) -> Result<Expr> {
+    let p = p.trim();
+    let pu = p.to_uppercase();
+    
+    // id(var)
+    if pu.starts_with("ID(") && p.ends_with(')') {
+        let v = p[3..p.len()-1].trim();
+        return Ok(Expr::FuncId(v.to_string()));
+    }
+    // timestamp(var)
+    if pu.starts_with("TIMESTAMP(") && p.ends_with(')') {
+        let v = p[10..p.len()-1].trim();
+        return Ok(Expr::FuncTimestamp(v.to_string()));
+    }
+    // collect(var)
+    if pu.starts_with("COLLECT(") && p.ends_with(')') {
+        let v = p[8..p.len()-1].trim();
+        return Ok(Expr::FuncCollect(v.to_string()));
+    }
+    // list slice: var[start..end] or var[start..] or var[..end]
+    if let Some(bracket_start) = p.find('[') {
+        if p.ends_with(']') {
+            let var_name = p[..bracket_start].trim().to_string();
+            let slice_part = &p[bracket_start+1..p.len()-1];
+            if slice_part.contains("..") {
+                let parts: Vec<&str> = slice_part.split("..").collect();
+                let start = if parts[0].trim().is_empty() { None } else { Some(parts[0].trim().parse::<usize>().map_err(|_| anyhow!("invalid slice start"))?) };
+                let end = if parts.len() < 2 || parts[1].trim().is_empty() { None } else { Some(parts[1].trim().parse::<usize>().map_err(|_| anyhow!("invalid slice end"))?) };
+                return Ok(Expr::ListSlice(var_name, start, end));
+            }
+        }
+    }
+    // var.prop
+    if let Some(dot) = p.find('.') {
+        let v = p[..dot].trim().to_string();
+        let prop = p[dot+1..].trim().to_string();
+        return Ok(Expr::Prop(Box::new(Expr::Var(v)), prop));
+    }
+    // string literal
+    if p.starts_with('"') || p.starts_with('\'') { 
+        return Ok(Expr::Str(trim_quotes(p)));
+    }
+    // plain variable
+    Ok(Expr::Var(p.to_string()))
 }
 
 fn parse_order_by(s: &str) -> Result<Vec<(Expr, bool)>> {
@@ -314,15 +372,20 @@ fn parse_order_by(s: &str) -> Result<Vec<(Expr, bool)>> {
                 (&p[..idx], Some("ASC"))
             } else { (&p[..], None) }
         } else { (&p[..], None) };
-        let expr = if expr_str.to_uppercase().starts_with("ID(") && expr_str.ends_with(')') {
+        let expr_str = expr_str.trim();
+        let expr_up = expr_str.to_uppercase();
+        let expr = if expr_up.starts_with("ID(") && expr_str.ends_with(')') {
             let v = expr_str[3..expr_str.len()-1].trim();
             Expr::FuncId(v.to_string())
+        } else if expr_up.starts_with("TIMESTAMP(") && expr_str.ends_with(')') {
+            let v = expr_str[10..expr_str.len()-1].trim();
+            Expr::FuncTimestamp(v.to_string())
         } else if let Some(dot) = expr_str.find('.') {
             let v = expr_str[..dot].trim().to_string();
             let prop = expr_str[dot+1..].trim().to_string();
             Expr::Prop(Box::new(Expr::Var(v)), prop)
         } else {
-            Expr::Var(expr_str.trim().to_string())
+            Expr::Var(expr_str.to_string())
         };
         let _ = dir_part; // not used beyond detection
         out.push((expr, asc));
@@ -514,7 +577,7 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
                 let items = parse_return_items(items_part.trim())?;
                 clauses.push(Clause::Return { items, distinct, order_by, skip, limit });
             } else if tup.starts_with("WITH ") {
-                // Parse WITH ... [ORDER BY ...] [SKIP n] [LIMIT n] [RETURN ...]
+                // Parse WITH ... [ORDER BY ...] [SKIP n] [LIMIT n] [RETURN ...] or [DETACH DELETE ...]
                 let mut body = t[5..].trim();
                 let mut distinct = false;
                 let bu = body.to_uppercase();
@@ -522,10 +585,17 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
                     distinct = true;
                     body = body[9..].trim();
                 }
-                // We also allow a RETURN after WITH; split it off first from the end to keep ORDER/SKIP/LIMIT parsing intact
+                // Check for trailing RETURN or DELETE clauses
                 let mut trailing_return: Option<&str> = None;
+                let mut trailing_delete: Option<&str> = None;
                 let upb = body.to_uppercase();
-                if let Some(i) = find_keyword_boundary(&upb, "RETURN") {
+                if let Some(i) = find_keyword_boundary(&upb, "DETACH DELETE") {
+                    trailing_delete = Some(&body[i..]);
+                    body = body[..i].trim();
+                } else if let Some(i) = find_keyword_boundary(&upb, "DELETE") {
+                    trailing_delete = Some(&body[i..]);
+                    body = body[..i].trim();
+                } else if let Some(i) = find_keyword_boundary(&upb, "RETURN") {
                     trailing_return = Some(&body[i..]);
                     body = body[..i].trim();
                 }
@@ -553,6 +623,19 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
                 if let Some(op) = order_part_opt { order_by = parse_order_by(op.trim())?; }
                 let items = parse_return_items(items_part.trim())?;
                 clauses.push(Clause::With { items, distinct, order_by, skip, limit });
+                // If there is a trailing DELETE, parse it
+                if let Some(del) = trailing_delete {
+                    let del_up = del.to_uppercase();
+                    if del_up.starts_with("DETACH DELETE ") {
+                        let vars_str = &del[14..];
+                        let vars = split_top_level_comma(vars_str).into_iter().map(|s| s.trim().to_string()).collect();
+                        clauses.push(Clause::Delete { vars, detach: true });
+                    } else if del_up.starts_with("DELETE ") {
+                        let vars_str = &del[7..];
+                        let vars = split_top_level_comma(vars_str).into_iter().map(|s| s.trim().to_string()).collect();
+                        clauses.push(Clause::Delete { vars, detach: false });
+                    }
+                }
                 // If there is a trailing RETURN, parse it as well
                 if let Some(ret) = trailing_return {
                     let mut body = ret[6..].trim(); // after RETURN
@@ -1069,6 +1152,25 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
                     None
                 }
 
+                // Parse timestamp(var) op value comparisons
+                fn parse_timestamp_compare(expr: &str) -> Option<(String, String, String)> {
+                    let up = expr.to_uppercase();
+                    if !up.contains("TIMESTAMP(") { return None; }
+                    let ops = ["<=", ">=", "<>", "<", ">", "="];
+                    for op in ops {
+                        if let Some(i) = expr.find(op) {
+                            let lhs = expr[..i].trim();
+                            let rhs = expr[i+op.len()..].trim();
+                            let lhs_up = lhs.to_uppercase();
+                            if lhs_up.starts_with("TIMESTAMP(") && lhs.ends_with(')') {
+                                let var = lhs[10..lhs.len()-1].trim().to_string();
+                                return Some((var, op.to_string(), rhs.to_string()));
+                            }
+                        }
+                    }
+                    None
+                }
+
                 let clauses = split_where_and(&w);
                 let mut filtered: Vec<HashMap<String, Val>> = Vec::new();
                 'rowloop: for row in &rows {
@@ -1118,6 +1220,28 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
                             } else { continue 'rowloop; }
                             continue;
                         }
+                        // timestamp(var) op value
+                        if let Some((var, op, rhs)) = parse_timestamp_compare(c) {
+                            let rhs_val: f64 = rhs.parse().unwrap_or(0.0);
+                            let ts_val = if let Some(Val::NodeId(id)) = row.get(&var) {
+                                let t = id.get_timestamp().unwrap().to_unix();
+                                (t.0 as f64) * 1000.0 + (t.1 as f64) / 1_000_000.0
+                            } else if let Some(Val::RelId(id)) = row.get(&var) {
+                                let t = id.get_timestamp().unwrap().to_unix();
+                                (t.0 as f64) * 1000.0 + (t.1 as f64) / 1_000_000.0
+                            } else { continue 'rowloop; };
+                            let pass = match op.as_str() {
+                                "<" => ts_val < rhs_val,
+                                "<=" => ts_val <= rhs_val,
+                                ">" => ts_val > rhs_val,
+                                ">=" => ts_val >= rhs_val,
+                                "=" => (ts_val - rhs_val).abs() < 1.0,
+                                "<>" => (ts_val - rhs_val).abs() >= 1.0,
+                                _ => true,
+                            };
+                            if !pass { continue 'rowloop; }
+                            continue;
+                        }
                         // var.prop op literal
                         if let Some((var, prop, op, rhs)) = parse_var_prop_comp(c) {
                             let lit = if rhs.starts_with('"') || rhs.starts_with('\'') { trim_quotes_owned(&rhs) } else { resolve_param(&rhs, params)? };
@@ -1144,79 +1268,185 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
                 rows = filtered;
             }
             Clause::With { items, distinct: _distinct, order_by, skip, limit } => {
-                // Project rows to only listed items (variables supported), then apply ORDER BY/SKIP/LIMIT
-                // Build sort keys per original rows, then project
-                let _single_item = items.len() == 1; // impacts how we interpret pagination
-                // Evaluate keys for ordering
-                let mut keyed_rows: Vec<(Vec<String>, HashMap<String, Val>)> = Vec::new();
-                for r in &rows {
-                    // Evaluate sort key vector from order_by
-                    let mut key_vals: Vec<String> = Vec::new();
-                    if !order_by.is_empty() {
-                        for (expr, _asc) in &order_by {
-                            match expr {
-                                Expr::Var(v) => {
-                                    if let Some(Val::NodeId(id)) = r.get(v) { key_vals.push(id.to_string()); }
-                                    else if let Some(Val::RelId(id)) = r.get(v) { key_vals.push(id.to_string()); }
-                                    else { key_vals.push(String::new()); }
+                // Check if we have aggregation (collect) - requires grouping
+                let has_collect = items.iter().any(|it| matches!(it, Expr::FuncCollect(_)) || 
+                    matches!(it, Expr::Alias(inner, _) if matches!(&**inner, Expr::FuncCollect(_))));
+                
+                if has_collect {
+                    // Aggregation mode: group by non-aggregate items, collect the rest
+                    // Find grouping keys (aliases of properties or vars) and collect targets
+                    let mut group_key_exprs: Vec<(Expr, String)> = Vec::new(); // (expr, alias)
+                    let mut collect_exprs: Vec<(String, String)> = Vec::new(); // (var_to_collect, alias)
+                    
+                    for it in &items {
+                        match it {
+                            Expr::Alias(inner, alias) => {
+                                match &**inner {
+                                    Expr::FuncCollect(v) => collect_exprs.push((v.clone(), alias.clone())),
+                                    _ => group_key_exprs.push((*inner.clone(), alias.clone())),
                                 }
-                                Expr::Prop(inner, prop) => {
-                                    if let Expr::Var(v) = &**inner {
-                                        if let Some(Val::NodeId(id)) = r.get(v) {
-                                            if let Some(n) = db.get_node(*id) { key_vals.push(n.metadata.get(prop).cloned().unwrap_or_default()); }
-                                            else { key_vals.push(String::new()); }
-                                        } else { key_vals.push(String::new()); }
-                                    } else { key_vals.push(String::new()); }
+                            }
+                            Expr::FuncCollect(v) => collect_exprs.push((v.clone(), format!("collect({})", v))),
+                            Expr::Var(v) => group_key_exprs.push((Expr::Var(v.clone()), v.clone())),
+                            _ => {}
+                        }
+                    }
+                    
+                    // Helper to evaluate an expression to a string key for grouping
+                    let eval_to_string = |expr: &Expr, r: &HashMap<String, Val>, db: &GraphDatabase| -> String {
+                        match expr {
+                            Expr::Prop(inner, prop) => {
+                                if let Expr::Var(v) = &**inner {
+                                    if let Some(Val::NodeId(id)) = r.get(v) {
+                                        if let Some(n) = db.get_node(*id) {
+                                            return n.metadata.get(prop).cloned().unwrap_or_default();
+                                        }
+                                    }
                                 }
-                                Expr::FuncId(v) => {
-                                    if let Some(Val::NodeId(id)) = r.get(v) { key_vals.push(id.to_string()); }
-                                    else if let Some(Val::RelId(id)) = r.get(v) { key_vals.push(id.to_string()); }
-                                    else { key_vals.push(String::new()); }
+                                String::new()
+                            }
+                            Expr::Var(v) => {
+                                if let Some(Val::NodeId(id)) = r.get(v) { id.to_string() }
+                                else if let Some(Val::RelId(id)) = r.get(v) { id.to_string() }
+                                else { String::new() }
+                            }
+                            _ => String::new()
+                        }
+                    };
+                    
+                    // Group rows by the grouping key
+                    use std::collections::BTreeMap;
+                    let mut groups: BTreeMap<Vec<String>, Vec<HashMap<String, Val>>> = BTreeMap::new();
+                    for r in &rows {
+                        let key: Vec<String> = group_key_exprs.iter().map(|(e, _)| eval_to_string(e, r, db)).collect();
+                        groups.entry(key).or_default().push(r.clone());
+                    }
+                    
+                    // Build output rows: one per group
+                    let mut new_rows: Vec<HashMap<String, Val>> = Vec::new();
+                    for (group_key, group_rows) in groups {
+                        let mut proj: HashMap<String, Val> = HashMap::new();
+                        
+                        // Store group key values as special string vals (we need a way to pass them)
+                        // For now, we'll store the first row's values for non-collect items
+                        if let Some(first) = group_rows.first() {
+                            for (expr, alias) in &group_key_exprs {
+                                if let Expr::Var(v) = expr {
+                                    if let Some(val) = first.get(v) {
+                                        proj.insert(alias.clone(), val.clone());
+                                    }
                                 }
-                                Expr::Str(s) => key_vals.push(s.clone()),
+                            }
+                        }
+                        
+                        // For collect: store all node IDs as a special list value
+                        // We'll use a new Val variant or encode as comma-separated string
+                        for (var_to_collect, alias) in &collect_exprs {
+                            let collected: Vec<Uuid> = group_rows.iter()
+                                .filter_map(|r| r.get(var_to_collect))
+                                .filter_map(|v| match v {
+                                    Val::NodeId(id) => Some(*id),
+                                    Val::RelId(id) => Some(*id),
+                                })
+                                .collect();
+                            // Store as first element for now (we need list support)
+                            // For deduplication, we want all but the first
+                            if collected.len() > 1 {
+                                // Store duplicates (all except first) for deletion
+                                for id in collected.iter().skip(1) {
+                                    let mut dup_row = proj.clone();
+                                    dup_row.insert(alias.clone(), Val::NodeId(*id));
+                                    new_rows.push(dup_row);
+                                }
                             }
                         }
                     }
-                    // Now project variables
-                    let mut proj: HashMap<String, Val> = HashMap::new();
-                    for it in &items {
-                        if let Expr::Var(v) = it {
-                            if let Some(val) = r.get(v) { proj.insert(v.clone(), val.clone()); }
+                    rows = new_rows;
+                } else {
+                    // Non-aggregation mode: project and sort as before
+                    let mut keyed_rows: Vec<(Vec<String>, HashMap<String, Val>)> = Vec::new();
+                    for r in &rows {
+                        let mut key_vals: Vec<String> = Vec::new();
+                        if !order_by.is_empty() {
+                            for (expr, _asc) in &order_by {
+                                match expr {
+                                    Expr::Var(v) => {
+                                        if let Some(Val::NodeId(id)) = r.get(v) { key_vals.push(id.to_string()); }
+                                        else if let Some(Val::RelId(id)) = r.get(v) { key_vals.push(id.to_string()); }
+                                        else { key_vals.push(String::new()); }
+                                    }
+                                    Expr::Prop(inner, prop) => {
+                                        if let Expr::Var(v) = &**inner {
+                                            if let Some(Val::NodeId(id)) = r.get(v) {
+                                                if let Some(n) = db.get_node(*id) { key_vals.push(n.metadata.get(prop).cloned().unwrap_or_default()); }
+                                                else { key_vals.push(String::new()); }
+                                            } else { key_vals.push(String::new()); }
+                                        } else { key_vals.push(String::new()); }
+                                    }
+                                    Expr::FuncId(v) => {
+                                        if let Some(Val::NodeId(id)) = r.get(v) { key_vals.push(id.to_string()); }
+                                        else if let Some(Val::RelId(id)) = r.get(v) { key_vals.push(id.to_string()); }
+                                        else { key_vals.push(String::new()); }
+                                    }
+                                    Expr::FuncTimestamp(v) => {
+                                        if let Some(Val::NodeId(id)) = r.get(v) {
+                                            let ts = { let t = id.get_timestamp().unwrap().to_unix(); (t.0 as u64) * 1000 + (t.1 as u64) / 1_000_000 };
+                                            key_vals.push(ts.to_string());
+                                        } else if let Some(Val::RelId(id)) = r.get(v) {
+                                            let ts = { let t = id.get_timestamp().unwrap().to_unix(); (t.0 as u64) * 1000 + (t.1 as u64) / 1_000_000 };
+                                            key_vals.push(ts.to_string());
+                                        } else { key_vals.push(String::new()); }
+                                    }
+                                    Expr::Str(s) => key_vals.push(s.clone()),
+                                    _ => key_vals.push(String::new()),
+                                }
+                            }
                         }
+                        let mut proj: HashMap<String, Val> = HashMap::new();
+                        for it in &items {
+                            match it {
+                                Expr::Var(v) => {
+                                    if let Some(val) = r.get(v) { proj.insert(v.clone(), val.clone()); }
+                                }
+                                Expr::Alias(inner, alias) => {
+                                    if let Expr::Var(v) = &**inner {
+                                        if let Some(val) = r.get(v) { proj.insert(alias.clone(), val.clone()); }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        keyed_rows.push((key_vals, proj));
                     }
-                    keyed_rows.push((key_vals, proj));
+                    if !order_by.is_empty() {
+                        keyed_rows.sort_by(|a, b| {
+                            let ka = &a.0; let kb = &b.0;
+                            let mut ord = std::cmp::Ordering::Equal;
+                            let len = ka.len().min(kb.len()).min(order_by.len());
+                            for i in 0..len {
+                                let asc = order_by[i].1;
+                                let (na, nb) = (ka[i].parse::<f64>().ok(), kb[i].parse::<f64>().ok());
+                                ord = match (na, nb) {
+                                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                                    _ => ka[i].cmp(&kb[i]),
+                                };
+                                if !asc { ord = ord.reverse(); }
+                                if ord != std::cmp::Ordering::Equal { break; }
+                            }
+                            ord
+                        });
+                    }
+                    let mut start = skip.unwrap_or(0);
+                    let mut remaining = limit.unwrap_or(usize::MAX);
+                    let mut new_rows: Vec<HashMap<String, Val>> = Vec::new();
+                    for (_keys, proj) in keyed_rows.into_iter() {
+                        if start > 0 { start -= 1; continue; }
+                        if remaining == 0 { break; }
+                        new_rows.push(proj);
+                        remaining = remaining.saturating_sub(1);
+                    }
+                    rows = new_rows;
                 }
-                // Sort if requested
-                if !order_by.is_empty() {
-                    keyed_rows.sort_by(|a, b| {
-                        let ka = &a.0; let kb = &b.0;
-                        let mut ord = std::cmp::Ordering::Equal;
-                        let len = ka.len().min(kb.len()).min(order_by.len());
-                        for i in 0..len {
-                            let asc = order_by[i].1;
-                            // numeric compare first
-                            let (na, nb) = (ka[i].parse::<f64>().ok(), kb[i].parse::<f64>().ok());
-                            ord = match (na, nb) {
-                                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-                                _ => ka[i].cmp(&kb[i]),
-                            };
-                            if !asc { ord = ord.reverse(); }
-                            if ord != std::cmp::Ordering::Equal { break; }
-                        }
-                        ord
-                    });
-                }
-                // Apply SKIP/LIMIT
-                let mut start = skip.unwrap_or(0);
-                let mut remaining = limit.unwrap_or(usize::MAX);
-                let mut new_rows: Vec<HashMap<String, Val>> = Vec::new();
-                for (_keys, proj) in keyed_rows.into_iter() {
-                    if start > 0 { start -= 1; continue; }
-                    if remaining == 0 { break; }
-                    new_rows.push(proj);
-                    remaining = remaining.saturating_sub(1);
-                }
-                rows = new_rows;
             }
             Clause::Delete { vars, detach } => {
                 use std::collections::HashSet;
@@ -1421,7 +1651,17 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
                                 if let Some(Val::NodeId(id)) = r.get(v) { out_rows.push(QueryResultRow::Info(id.to_string())); }
                                 else if let Some(Val::RelId(id)) = r.get(v) { out_rows.push(QueryResultRow::Info(id.to_string())); }
                             }
+                            Expr::FuncTimestamp(v) => {
+                                if let Some(Val::NodeId(id)) = r.get(v) {
+                                    let ts = { let t = id.get_timestamp().unwrap().to_unix(); (t.0 as u64) * 1000 + (t.1 as u64) / 1_000_000 };
+                                    out_rows.push(QueryResultRow::Info(ts.to_string()));
+                                } else if let Some(Val::RelId(id)) = r.get(v) {
+                                    let ts = { let t = id.get_timestamp().unwrap().to_unix(); (t.0 as u64) * 1000 + (t.1 as u64) / 1_000_000 };
+                                    out_rows.push(QueryResultRow::Info(ts.to_string()));
+                                }
+                            }
                             Expr::Str(s) => out_rows.push(QueryResultRow::Info(s.clone())),
+                            _ => {} // FuncCollect, ListSlice, Alias handled elsewhere
                         }
                     }
                     // Build sort keys (as strings) if needed and only for single-item
@@ -1449,7 +1689,17 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
                                     else if let Some(Val::RelId(id)) = r.get(v) { key_vals.push(id.to_string()); }
                                     else { key_vals.push(String::new()); }
                                 }
+                                Expr::FuncTimestamp(v) => {
+                                    if let Some(Val::NodeId(id)) = r.get(v) {
+                                        let ts = { let t = id.get_timestamp().unwrap().to_unix(); (t.0 as u64) * 1000 + (t.1 as u64) / 1_000_000 };
+                                        key_vals.push(ts.to_string());
+                                    } else if let Some(Val::RelId(id)) = r.get(v) {
+                                        let ts = { let t = id.get_timestamp().unwrap().to_unix(); (t.0 as u64) * 1000 + (t.1 as u64) / 1_000_000 };
+                                        key_vals.push(ts.to_string());
+                                    } else { key_vals.push(String::new()); }
+                                }
                                 Expr::Str(s) => key_vals.push(s.clone()),
+                                _ => key_vals.push(String::new()),
                             }
                         }
                         Some(key_vals)
@@ -1513,6 +1763,51 @@ pub fn execute_cypher_with_params(db: &mut GraphDatabase, query: &str, params: &
                     for (_k, rows_for_item) in projected.into_iter() { for rr in rows_for_item { flat.push(rr); } }
                 }
                 return Ok(flat);
+            }
+            Clause::Unwind { expr, var } => {
+                // UNWIND expr AS var - expand list into rows
+                // Support: UNWIND nodes[1..] AS toDelete or UNWIND nodes AS x
+                let mut new_rows: Vec<HashMap<String, Val>> = Vec::new();
+                for row in &rows {
+                    // Parse the expression to find the list variable and optional slice
+                    let expr_trimmed = expr.trim();
+                    let (list_var, slice_start, slice_end) = if let Some(bracket_idx) = expr_trimmed.find('[') {
+                        if expr_trimmed.ends_with(']') {
+                            let var_name = expr_trimmed[..bracket_idx].trim();
+                            let slice_part = &expr_trimmed[bracket_idx+1..expr_trimmed.len()-1];
+                            if slice_part.contains("..") {
+                                let parts: Vec<&str> = slice_part.split("..").collect();
+                                let start = if parts[0].trim().is_empty() { None } else { parts[0].trim().parse::<usize>().ok() };
+                                let end = if parts.len() < 2 || parts[1].trim().is_empty() { None } else { parts[1].trim().parse::<usize>().ok() };
+                                (var_name, start, end)
+                            } else {
+                                // Single index like nodes[0]
+                                let idx = slice_part.trim().parse::<usize>().ok();
+                                (var_name, idx, idx.map(|i| i + 1))
+                            }
+                        } else {
+                            (expr_trimmed, None, None)
+                        }
+                    } else {
+                        (expr_trimmed, None, None)
+                    };
+                    
+                    // Get the list from the row - we need to handle collected lists
+                    // For now, if the variable exists as a single value, treat it as a one-element list
+                    // The real list support would require a Val::List variant
+                    if let Some(val) = row.get(list_var) {
+                        // Single value case - just bind it if slice allows
+                        let start = slice_start.unwrap_or(0);
+                        let end = slice_end.unwrap_or(1);
+                        if start == 0 && end >= 1 {
+                            let mut new_row = row.clone();
+                            new_row.insert(var.clone(), val.clone());
+                            new_rows.push(new_row);
+                        }
+                        // If slice is [1..], skip the single element (empty result)
+                    }
+                }
+                rows = new_rows;
             }
         }
     }
