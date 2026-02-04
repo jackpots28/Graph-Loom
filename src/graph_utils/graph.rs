@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
+use rayon::prelude::*;
 
 // Basic type aliases for clarity
 pub type NodeId = Uuid;
@@ -13,6 +14,8 @@ pub struct Node {
     pub id: NodeId,
     pub label: String,
     pub metadata: HashMap<Key, Value>,
+    pub out_rels: Vec<Uuid>,
+    pub in_rels: Vec<Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,6 +31,8 @@ pub struct Relationship {
 pub struct GraphDatabase {
     pub nodes: HashMap<NodeId, Node>,
     pub relationships: HashMap<Uuid, Relationship>,
+    #[serde(skip)]
+    pub label_index: HashMap<String, Vec<NodeId>>,
 }
 
 impl GraphDatabase {
@@ -36,14 +41,22 @@ impl GraphDatabase {
         GraphDatabase {
             nodes: HashMap::new(),
             relationships: HashMap::new(),
+            label_index: HashMap::new(),
         }
     }
 
     // Add a node and return its new ID
     pub fn add_node(&mut self, label: String, metadata: HashMap<Key, Value>) -> NodeId {
         let id = Uuid::now_v7();
-        let node = Node { id, label, metadata };
+        let node = Node {
+            id,
+            label: label.clone(),
+            metadata,
+            out_rels: Vec::new(),
+            in_rels: Vec::new(),
+        };
         self.nodes.insert(id, node);
+        self.label_index.entry(label).or_default().push(id);
         id
     }
 
@@ -59,6 +72,15 @@ impl GraphDatabase {
             let id = Uuid::now_v7();
             let relationship = Relationship { id, from_node, to_node, label, metadata };
             self.relationships.insert(id, relationship);
+
+            // Update adjacency lists
+            if let Some(from) = self.nodes.get_mut(&from_node) {
+                from.out_rels.push(id);
+            }
+            if let Some(to) = self.nodes.get_mut(&to_node) {
+                to.in_rels.push(id);
+            }
+
             Some(id)
         } else {
             None
@@ -67,7 +89,18 @@ impl GraphDatabase {
 
     pub fn update_node_label(&mut self, id: NodeId, new_label: String) -> bool {
         if let Some(node) = self.nodes.get_mut(&id) {
-            node.label = new_label;
+            let old_label = node.label.clone();
+            if old_label == new_label {
+                return true;
+            }
+
+            // Remove from old label index
+            if let Some(vec) = self.label_index.get_mut(&old_label) {
+                vec.retain(|&x| x != id);
+            }
+
+            node.label = new_label.clone();
+            self.label_index.entry(new_label).or_default().push(id);
             true
         } else {
             false
@@ -139,21 +172,31 @@ impl GraphDatabase {
 
     // Delete operations
     pub fn remove_relationship(&mut self, id: Uuid) -> bool {
-        self.relationships.remove(&id).is_some()
+        if let Some(rel) = self.relationships.remove(&id) {
+            // Remove from adjacency lists
+            if let Some(from) = self.nodes.get_mut(&rel.from_node) {
+                from.out_rels.retain(|&x| x != id);
+            }
+            if let Some(to) = self.nodes.get_mut(&rel.to_node) {
+                to.in_rels.retain(|&x| x != id);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     pub fn remove_node(&mut self, id: NodeId) -> bool {
-        if self.nodes.remove(&id).is_some() {
+        if let Some(node) = self.nodes.remove(&id) {
+            // Remove from label index
+            if let Some(vec) = self.label_index.get_mut(&node.label) {
+                vec.retain(|&x| x != id);
+            }
+
             // Cascade delete relationships involving this node
-            let to_remove: Vec<Uuid> = self
-                .relationships
-                .iter()
-                .filter_map(|(rid, rel)| {
-                    if rel.from_node == id || rel.to_node == id { Some(*rid) } else { None }
-                })
-                .collect();
+            let to_remove: Vec<Uuid> = node.out_rels.iter().chain(node.in_rels.iter()).copied().collect();
             for rid in to_remove {
-                self.relationships.remove(&rid);
+                self.remove_relationship(rid);
             }
             true
         } else {
@@ -168,21 +211,25 @@ impl GraphDatabase {
     #[allow(dead_code)]
     pub fn relationship_count(&self) -> usize { self.relationships.len() }
 
+    /// Rebuilds the label index from the current nodes. Useful after deserialization.
+    pub fn rebuild_indices(&mut self) {
+        self.label_index.clear();
+        for (id, node) in &self.nodes {
+            self.label_index.entry(node.label.clone()).or_default().push(*id);
+        }
+    }
+
     // Fetch helpers:
     // Nodes
     pub fn find_node_ids_by_label(&self, label: &str) -> Vec<NodeId> {
-        self
-            .nodes
-            .iter()
-            .filter_map(|(&id, node)| if node.label == label { Some(id) } else { None })
-            .collect()
+        self.label_index.get(label).cloned().unwrap_or_default()
     }
 
     #[allow(dead_code)]
     pub fn find_node_ids_by_metadata_key(&self, key: &str) -> Vec<NodeId> {
         self
             .nodes
-            .iter()
+            .par_iter()
             .filter_map(|(&id, node)| if node.metadata.contains_key(key) { Some(id) } else { None })
             .collect()
     }
@@ -191,7 +238,7 @@ impl GraphDatabase {
     pub fn find_node_ids_by_metadata_kv(&self, key: &str, value: &str) -> Vec<NodeId> {
         self
             .nodes
-            .iter()
+            .par_iter()
             .filter_map(|(&id, node)| match node.metadata.get(key) {
                 Some(v) if v == value => Some(id),
                 _ => None,
@@ -203,7 +250,7 @@ impl GraphDatabase {
     pub fn find_relationship_ids_by_label(&self, label: &str) -> Vec<Uuid> {
         self
             .relationships
-            .iter()
+            .par_iter()
             .filter_map(|(&id, rel)| if rel.label == label { Some(id) } else { None })
             .collect()
     }
@@ -212,7 +259,7 @@ impl GraphDatabase {
     pub fn find_relationship_ids_by_metadata_key(&self, key: &str) -> Vec<Uuid> {
         self
             .relationships
-            .iter()
+            .par_iter()
             .filter_map(|(&id, rel)| if rel.metadata.contains_key(key) { Some(id) } else { None })
             .collect()
     }
@@ -221,7 +268,7 @@ impl GraphDatabase {
     pub fn find_relationship_ids_by_metadata_kv(&self, key: &str, value: &str) -> Vec<Uuid> {
         self
             .relationships
-            .iter()
+            .par_iter()
             .filter_map(|(&id, rel)| match rel.metadata.get(key) {
                 Some(v) if v == value => Some(id),
                 _ => None,
