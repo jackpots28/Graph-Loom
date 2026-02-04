@@ -53,13 +53,14 @@ impl AppStateFile {
     /// This intentionally consumes `self` to avoid cloning large buffers.
     /// Keeping the existing API preserves behavior; allow clippy's naming lint.
     #[allow(clippy::wrong_self_convention)]
-    pub fn to_runtime(self) -> (GraphDatabase, HashMap<NodeId, egui::Pos2>, egui::Vec2, f32) {
+    pub fn to_runtime(mut self) -> (GraphDatabase, HashMap<NodeId, egui::Pos2>, egui::Vec2, f32) {
         let positions: HashMap<NodeId, egui::Pos2> = self
             .node_positions
             .into_iter()
             .map(|(id, x, y)| (id, egui::pos2(x, y)))
             .collect();
         let pan = egui::vec2(self.pan.0, self.pan.1);
+        self.db.rebuild_indices();
         (self.db, positions, pan, self.zoom)
     }
 }
