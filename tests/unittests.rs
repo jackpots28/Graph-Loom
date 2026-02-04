@@ -21,6 +21,79 @@ fn ids_from_rows(rows: &[QueryResultRow]) -> Vec<Uuid> {
 }
 
 #[test]
+fn cypher_timestamp_function() {
+    let mut db = new_db();
+    execute_query(&mut db, "CREATE (:Event {name: 'First'})").unwrap();
+    // sleep for a tiny bit to ensure timestamp difference if needed, 
+    // though uuid7 has sub-ms precision, sometimes it might be too fast.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    execute_query(&mut db, "CREATE (:Event {name: 'Second'})").unwrap();
+
+    // Test sorting by timestamp
+    let q = "MATCH (e:Event) RETURN e.name ORDER BY timestamp(e) DESC";
+    let out = execute_query(&mut db, q).unwrap();
+    assert_eq!(out.rows.len(), 2);
+    if let QueryResultRow::Info(name) = &out.rows[0] {
+        assert_eq!(name, "Second");
+    } else { panic!("Expected Info row"); }
+    if let QueryResultRow::Info(name) = &out.rows[1] {
+        assert_eq!(name, "First");
+    } else { panic!("Expected Info row"); }
+
+    // Test WHERE with timestamp
+    // We get the timestamp of the first node to use in a query
+    let q_ts = "MATCH (e:Event {name: 'First'}) RETURN timestamp(e)";
+    let out_ts = execute_query(&mut db, q_ts).unwrap();
+    let ts_val: f64 = match &out_ts.rows[0] {
+        QueryResultRow::Info(s) => s.parse().unwrap(),
+        _ => panic!("Expected timestamp info"),
+    };
+
+    let q_where = format!("MATCH (e:Event) WHERE timestamp(e) > {} RETURN e.name", ts_val);
+    let out_where = execute_query(&mut db, &q_where).unwrap();
+    assert_eq!(out_where.rows.len(), 1);
+    if let QueryResultRow::Info(name) = &out_where.rows[0] {
+        assert_eq!(name, "Second");
+    } else { panic!("Expected Info row"); }
+}
+
+#[test]
+fn cypher_deduplication_query() {
+    let mut db = new_db();
+    // Create duplicate URL nodes with same ShortDescription
+    execute_query(&mut db, "CREATE (:URL {ShortDescription: 'Same', url: 'http://a.com'})").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    execute_query(&mut db, "CREATE (:URL {ShortDescription: 'Same', url: 'http://b.com'})").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    execute_query(&mut db, "CREATE (:URL {ShortDescription: 'Same', url: 'http://c.com'})").unwrap();
+
+    // Verify we have 3 nodes
+    let out = execute_query(&mut db, "MATCH (n:URL) RETURN n").unwrap();
+    assert_eq!(out.rows.len(), 3);
+
+    // Simplified deduplication: group by ShortDescription, collect nodes, delete all but newest
+    // This uses a single WITH clause with collect() which groups and outputs duplicates for deletion
+    let dedupe_query = "
+        MATCH (n:URL)
+        WITH n.ShortDescription AS desc, collect(n) AS nodes
+        DETACH DELETE nodes
+    ";
+    let res = execute_query(&mut db, dedupe_query);
+    
+    match res {
+        Ok(outcome) => {
+            println!("Outcome: mutated={}, nodes={}, rels={}", outcome.mutated, outcome.affected_nodes, outcome.affected_relationships);
+            // Check how many nodes remain
+            let check = execute_query(&mut db, "MATCH (n:URL) RETURN n").unwrap();
+            assert_eq!(check.rows.len(), 1, "Should have only 1 node left after deduplication");
+        },
+        Err(e) => {
+            panic!("Deduplication query failed: {}", e);
+        }
+    }
+}
+
+#[test]
 fn cypher_params_in_pattern_and_where() {
     let mut db = new_db();
     // Seed data
