@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use uuid::Uuid;
+use rayon::prelude::*;
 
 use crate::graph_utils::graph::{GraphDatabase, NodeId};
 use crate::persistence::persist::{self, AppStateFile};
@@ -491,10 +492,11 @@ impl GraphApp {
     fn apply_cluster_layout_all(&mut self, rect: Rect) {
         let cluster_positions = self.compute_community_layout(rect);
         let center = rect.center();
-        for id in self.db.nodes.keys().copied() {
+        let node_positions: HashMap<NodeId, Pos2> = self.db.nodes.par_iter().map(|(&id, _)| {
             let p = cluster_positions.get(&id).copied().unwrap_or(center);
-            self.node_positions.insert(id, p);
-        }
+            (id, p)
+        }).collect();
+        self.node_positions.extend(node_positions);
         // Ensure nodes are not overlapping after layout
         self.resolve_overlaps(rect);
         self.re_cluster_pending = false;
@@ -520,45 +522,43 @@ impl GraphApp {
         }
 
         // Precompute label/meta for similarity
-        let mut node_label: Map<NodeId, String> = Map::new();
-        let mut node_meta: Map<NodeId, Map<String, String>> = Map::new();
-        for (id, n) in &self.db.nodes {
-            node_label.insert(*id, n.label.clone());
-            node_meta.insert(*id, n.metadata.clone());
-        }
+        let node_label: Map<NodeId, String> = self.db.nodes.par_iter().map(|(id, n)| (*id, n.label.clone())).collect();
+        let node_meta: Map<NodeId, Map<String, String>> = self.db.nodes.par_iter().map(|(id, n)| (*id, n.metadata.clone())).collect();
 
         // Initialize labels (each node in its own community)
-        let mut community: Map<NodeId, NodeId> = Map::new();
-        for id in self.db.nodes.keys() {
-            community.insert(*id, *id);
+        let mut community: Map<NodeId, NodeId> = self.db.nodes.par_iter().map(|(id, _)| (*id, *id)).collect();
+
+        // Precompute similarity weights for all connected pairs
+        let mut sim_cache: Map<(NodeId, NodeId), f32> = Map::new();
+        for (&u, nbrs) in &neighbors {
+            for &v in nbrs {
+                let pair = if u < v { (u, v) } else { (v, u) };
+                if sim_cache.contains_key(&pair) { continue; }
+                
+                let la = node_label.get(&u).map(|s| s.as_str()).unwrap_or("");
+                let lb = node_label.get(&v).map(|s| s.as_str()).unwrap_or("");
+                let label_bonus = if la == lb && !la.is_empty() { 1.0 } else { 0.0 };
+                let ma = node_meta.get(&u);
+                let mb = node_meta.get(&v);
+                let mut meta_overlap = 0.0f32;
+                if let (Some(ma), Some(mb)) = (ma, mb) {
+                    let mut count = 0usize;
+                    let total = ma.len().max(1);
+                    for (k, va) in ma {
+                        if let Some(vb) = mb.get(k) {
+                            if vb == va { count += 1; }
+                        }
+                    }
+                    meta_overlap = (count as f32) / (total as f32);
+                }
+                let w = 1.0 + 0.75 * label_bonus + 0.5 * meta_overlap;
+                sim_cache.insert(pair, w);
+            }
         }
 
-        // Helper: compute similarity weight between two nodes
-        let mut sim_cache: Map<(NodeId, NodeId), f32> = Map::new();
-        let similarity = |a: NodeId, b: NodeId, sim_cache: &mut Map<(NodeId, NodeId), f32>| -> f32 {
-            if let Some(v) = sim_cache.get(&(a, b)) { return *v; }
-            let la = node_label.get(&a).map(|s| s.as_str()).unwrap_or("");
-            let lb = node_label.get(&b).map(|s| s.as_str()).unwrap_or("");
-            let label_bonus = if la == lb && !la.is_empty() { 1.0 } else { 0.0 };
-            let ma = node_meta.get(&a);
-            let mb = node_meta.get(&b);
-            let mut meta_overlap = 0.0f32;
-            if let (Some(ma), Some(mb)) = (ma, mb) {
-                // simple key/value overlap count
-                let mut count = 0usize;
-                let total = ma.len().max(1);
-                for (k, va) in ma {
-                    if let Some(vb) = mb.get(k) {
-                        if vb == va { count += 1; }
-                    }
-                }
-                // normalize by max meta size to bound in [0,1]
-                meta_overlap = (count as f32) / (total as f32);
-            }
-            // base weight for an edge is 1.0, plus label/meta bonuses when neighbors are similar
-            let w = 1.0 + 0.75 * label_bonus + 0.5 * meta_overlap;
-            sim_cache.insert((a, b), w);
-            w
+        let get_sim = |a: NodeId, b: NodeId, sim_cache: &Map<(NodeId, NodeId), f32>| -> f32 {
+            let pair = if a < b { (a, b) } else { (b, a) };
+            sim_cache.get(&pair).copied().unwrap_or(1.0)
         };
 
         // Label propagation iterations
@@ -568,10 +568,12 @@ impl GraphApp {
             let mut changed = false;
             for &u in &order {
                 let mut scores: Map<NodeId, f32> = Map::new();
-                for &v in neighbors.get(&u).unwrap_or(&Vec::new()) {
-                    let c = *community.get(&v).unwrap_or(&v);
-                    let w = similarity(u, v, &mut sim_cache);
-                    *scores.entry(c).or_insert(0.0) += w;
+                if let Some(nbrs) = neighbors.get(&u) {
+                    for &v in nbrs {
+                        let c = *community.get(&v).unwrap_or(&v);
+                        let w = get_sim(u, v, &sim_cache);
+                        *scores.entry(c).or_insert(0.0) += w;
+                    }
                 }
                 if let Some((&best_comm, _)) = scores
                     .iter()
@@ -600,26 +602,30 @@ impl GraphApp {
         }
 
         let mut comm_density: Map<NodeId, f32> = Map::new();
-        for (c, nodes) in &groups {
+        let densities: Vec<(NodeId, f32)> = groups.par_iter().map(|(&c, nodes)| {
             let s: Set<NodeId> = nodes.iter().copied().collect();
             let mut internal_edges = 0usize;
             let mut possible_edges = nodes.len().saturating_sub(1) * nodes.len() / 2; // undirected approximation
             if possible_edges == 0 { possible_edges = 1; }
             for &u in nodes {
-                for &v in neighbors.get(&u).unwrap_or(&Vec::new()) {
-                    if s.contains(&v) { internal_edges += 1; }
+                if let Some(nbrs) = neighbors.get(&u) {
+                    for &v in nbrs {
+                        if s.contains(&v) { internal_edges += 1; }
+                    }
                 }
             }
             // undirected correction
             let internal_undirected = internal_edges as f32 / 2.0;
-            comm_density.insert(*c, (internal_undirected) / (possible_edges as f32));
-        }
+            (c, (internal_undirected) / (possible_edges as f32))
+        }).collect();
+        for (c, d) in densities { comm_density.insert(c, d); }
 
-        // Place community centroids around a circle; radius based on density
+        // Place community centroids around a circle; radius based on density.
+        // To avoid "large centered grouping", we increase the spread and use a larger minimum radius.
         let center = rect.center();
         let min_dim = rect.width().min(rect.height());
-        let max_radius = 0.46 * min_dim; // near border
-        let min_radius = 0.12 * min_dim; // closer to center for sparse ones
+        let max_radius = 0.48 * min_dim; // closer to border
+        let min_radius = 0.25 * min_dim; // pushed out from center
 
         // Sort communities for stable placement
         let mut comm_ids: Vec<NodeId> = groups.keys().copied().collect();
@@ -629,6 +635,7 @@ impl GraphApp {
         let mut comm_centroids: Map<NodeId, Pos2> = Map::new();
         for (idx, cid) in comm_ids.iter().enumerate() {
             let density = *comm_density.get(cid).unwrap_or(&0.0);
+            // More spread: density maps to radius, but we ensure even very sparse ones are not at center.
             let r = min_radius + (max_radius - min_radius) * density.clamp(0.0, 1.0);
             let angle = (idx as f32) * (std::f32::consts::TAU / comm_count);
             let pos = Pos2::new(center.x + r * angle.cos(), center.y + r * angle.sin());
@@ -640,20 +647,20 @@ impl GraphApp {
         for (cid, nodes) in &groups {
             let centroid = *comm_centroids
                 .get(cid)
-                .unwrap_or(&center); // fallback to center if missing (shouldn't happen)
+                .unwrap_or(&center); 
             let n = nodes.len().max(1) as f32;
-            // local radius scales with community size while also being capped
-            let local_r_base = (min_dim * 0.08).min(30.0 + 6.0 * n.sqrt());
+            // local radius scales with community size; increased slightly for better parsing
+            let local_r_base = (min_dim * 0.12).min(40.0 + 8.0 * n.sqrt());
             let mut local_nodes = nodes.clone();
             local_nodes.sort();
             for (i, node) in local_nodes.iter().enumerate() {
                 let deg = *degree.get(node).unwrap_or(&0) as f32;
-                // Sparse nodes closer to center: lerp toward global center based on low degree
-                let deg_factor = (deg / 6.0).clamp(0.0, 1.0); // >6 neighbors => strong
-                let toward_center = 1.0 - deg_factor; // low degree -> higher pull
+                // Sparse nodes closer to center factor reduced to avoid central clustering.
+                let deg_factor = (deg / 6.0).clamp(0.0, 1.0); 
+                let toward_center = (1.0 - deg_factor) * 0.3; // reduced pull to global center (was 1.0)
 
                 let angle = (i as f32) * (std::f32::consts::TAU / n);
-                let local_r = local_r_base * (0.6 + 0.6 * deg_factor); // higher degree slightly farther within cluster
+                let local_r = local_r_base * (0.7 + 0.5 * deg_factor); 
                 let p_cluster = Pos2::new(centroid.x + local_r * angle.cos(), centroid.y + local_r * angle.sin());
                 let p = Pos2::new(
                     p_cluster.x * (1.0 - toward_center) + center.x * toward_center,
@@ -761,47 +768,45 @@ impl GraphApp {
             // Collect keys to avoid cloning the whole grid for iteration
             let keys: Vec<(i32, i32)> = grid.keys().cloned().collect();
 
-            for (ix, iy) in keys {
-                if let Some(ids) = grid.get(&(ix, iy)) {
-                    for (dx, dy) in offsets {
-                        let key = (ix + dx, iy + dy);
-                        if let Some(neigh_ids) = grid.get(&key) {
-                            for &a in ids {
-                                for &b in neigh_ids {
-                                    if a >= b { continue; } // avoid double-processing and self
-                                    
-                                    // Use a single borrow check if possible
-                                    let (pa, pb) = match (self.node_positions.get(&a), self.node_positions.get(&b)) {
-                                        (Some(pa), Some(pb)) => (*pa, *pb),
-                                        _ => continue,
-                                    };
-                                    
-                                    let dx = pb.x - pa.x;
-                                    let dy = pb.y - pa.y;
-                                    let d2 = dx*dx + dy*dy;
-                                    if d2 < min_dist_sq && d2 > 1e-6 {
-                                        let d = d2.sqrt();
-                                        let overlap = (min_dist - d) * 0.5; // split push
-                                        let nx = dx / d;
-                                        let ny = dy / d;
-                                        if let Some(p) = self.node_positions.get_mut(&a) {
-                                            p.x -= nx * overlap;
-                                            p.y -= ny * overlap;
-                                        }
-                                        if let Some(p) = self.node_positions.get_mut(&b) {
-                                            p.x += nx * overlap;
-                                            p.y += ny * overlap;
-                                        }
-                                    } else if d2 <= 1e-6 {
-                                        // Same position: nudge apart deterministically
-                                        if let Some(pa_mut) = self.node_positions.get_mut(&a) {
-                                            pa_mut.x -= 0.5 * min_dist;
-                                            pa_mut.y -= 0.3 * min_dist;
-                                        }
-                                        if let Some(pb_mut) = self.node_positions.get_mut(&b) {
-                                            pb_mut.x += 0.5 * min_dist;
-                                            pb_mut.y += 0.3 * min_dist;
-                                        }
+        for (ix, iy) in keys {
+            if let Some(ids) = grid.get(&(ix, iy)) {
+                for (dx, dy) in offsets {
+                    let key = (ix + dx, iy + dy);
+                    if let Some(neigh_ids) = grid.get(&key) {
+                        for &a in ids {
+                            for &b in neigh_ids {
+                                if a >= b { continue; } // avoid double-processing and self
+                                
+                                let (pa, pb) = match (self.node_positions.get(&a), self.node_positions.get(&b)) {
+                                    (Some(pa), Some(pb)) => (*pa, *pb),
+                                    _ => continue,
+                                };
+                                
+                                let dx = pb.x - pa.x;
+                                let dy = pb.y - pa.y;
+                                let d2 = dx*dx + dy*dy;
+                                if d2 < min_dist_sq && d2 > 1e-6 {
+                                    let d = d2.sqrt();
+                                    let overlap = (min_dist - d) * 0.5; // split push
+                                    let nx = dx / d;
+                                    let ny = dy / d;
+                                    if let Some(p) = self.node_positions.get_mut(&a) {
+                                        p.x -= nx * overlap;
+                                        p.y -= ny * overlap;
+                                    }
+                                    if let Some(p) = self.node_positions.get_mut(&b) {
+                                        p.x += nx * overlap;
+                                        p.y += ny * overlap;
+                                    }
+                                } else if d2 <= 1e-6 {
+                                    // Same position: nudge apart deterministically
+                                    if let Some(pa_mut) = self.node_positions.get_mut(&a) {
+                                        pa_mut.x -= 0.5 * min_dist;
+                                        pa_mut.y -= 0.3 * min_dist;
+                                    }
+                                    if let Some(pb_mut) = self.node_positions.get_mut(&b) {
+                                        pb_mut.x += 0.5 * min_dist;
+                                        pb_mut.y += 0.3 * min_dist;
                                     }
                                 }
                             }
@@ -809,12 +814,13 @@ impl GraphApp {
                     }
                 }
             }
+        }
 
             // Clamp into rect to avoid drifting out of view
-            for p in self.node_positions.values_mut() {
+            self.node_positions.par_iter_mut().for_each(|(_, p)| {
                 p.x = p.x.clamp(rect.left() + 8.0, rect.right() - 8.0);
                 p.y = p.y.clamp(rect.top() + 8.0, rect.bottom() - 8.0);
-            }
+            });
         }
     }
 
@@ -2595,7 +2601,18 @@ impl eframe::App for GraphApp {
                 let scroll = ui.input(|i| i.raw_scroll_delta.y);
                 if scroll != 0.0 {
                     let factor = (1.0 + scroll * 0.001).clamp(0.9, 1.1);
+                    let old_zoom = self.zoom;
                     self.zoom = (self.zoom * factor).clamp(0.25, 2.0);
+                    let actual_factor = self.zoom / old_zoom;
+
+                    if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        // Zoom around cursor:
+                        // (mouse_pos - center - pan_old) / zoom_old = (mouse_pos - center - pan_new) / zoom_new
+                        // pan_new = mouse_pos - center - (mouse_pos - center - pan_old) * actual_factor
+                        let center = available.center();
+                        self.pan = mouse_pos - center - (mouse_pos - center - self.pan) * actual_factor;
+                    }
+
                     // Show transient zoom HUD
                     self.zoom_hud_until = Some(Instant::now() + Duration::from_millis(1000));
                     ui.ctx().request_repaint_after(Duration::from_millis(16));
@@ -2631,10 +2648,12 @@ impl eframe::App for GraphApp {
             // Compute hover over nearest node within radius in screen space
             let mut hover_node: Option<NodeId> = None;
             if let Some(mouse_pos) = ui.ctx().pointer_hover_pos() {
-                let node_radius = 10.0 * self.zoom;
                 let mut best_d2 = f32::INFINITY;
-                for id in self.db.nodes.keys() {
+                for (id, node) in &self.db.nodes {
                     if let Some(pw) = self.node_positions.get(id) {
+                        let degree = node.out_rels.len() + node.in_rels.len();
+                        let base_radius = 10.0 + (degree as f32).sqrt() * 2.0;
+                        let node_radius = base_radius * self.zoom;
                         let ps = to_screen(*pw);
                         let dx = ps.x - mouse_pos.x; let dy = ps.y - mouse_pos.y;
                         let d2 = dx*dx + dy*dy;
@@ -2743,7 +2762,6 @@ impl eframe::App for GraphApp {
             }
 
             // Draw and interact with nodes
-            let node_radius_draw = 10.0 * self.zoom; // scale with zoom for easier hit testing
             let mut clicked_node: Option<NodeId> = None;
             let mut any_node_dragged = false;
             let was_dragging = self.dragging.is_some();
@@ -2757,6 +2775,11 @@ impl eframe::App for GraphApp {
                 // Safe to immutably read the node after the mutable borrow in get_or_init_position ends
                 let node = match self.db.nodes.get(&id) { Some(n) => n, None => continue };
                 let pos_screen = to_screen(pos_world);
+
+                let degree = node.out_rels.len() + node.in_rels.len();
+                let base_radius = 10.0 + (degree as f32).sqrt() * 2.0;
+                let node_radius_draw = base_radius * self.zoom;
+
                 let rect = Rect::from_center_size(pos_screen, Vec2::splat(node_radius_draw * 2.0));
                 let resp = ui.allocate_rect(rect, Sense::click_and_drag());
 
@@ -3022,14 +3045,15 @@ impl eframe::App for GraphApp {
                 // Nearby nodes experience a soft repulsive force to maintain spacing.
                 // We integrate per-node velocities with damping for fluid motion.
                 let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.033);
-                let target_dist = 120.0_f32; // preferred edge length in world space
-                let spring_k = 4.0_f32;      // edge spring stiffness (units/s^2)
-                let damping = 6.0_f32;       // velocity damping (units/s)
-                let min_sep = 90.0_f32;      // minimum comfortable spacing
-                let repulse_k = 10.0_f32;    // repulsion strength
-                let max_speed = 600.0_f32;   // clamp velocity magnitude (units/s)
-                let max_step = 5.0_f32;      // clamp displacement per frame (units)
-                let mouse_k = 20.0_f32;      // drag-to-mouse spring stiffness
+                let target_dist = 110.0_f32; // preferred edge length in world space (increased for better parsing)
+                let spring_k = 30.0_f32;     // edge spring stiffness
+                let damping = 12.0_f32;      // velocity damping
+                let min_sep = 100.0_f32;     // minimum comfortable spacing (increased for better parsing)
+                let _min_sep_val = min_sep;  // ensure it's used if needed below
+                let repulse_k = 45.0_f32;    // repulsion strength (increased slightly)
+                let max_speed = 2000.0_f32;  // clamp velocity magnitude (increased from 1000.0)
+                let max_step = 25.0_f32;     // clamp displacement per frame (increased from 10.0)
+                let mouse_k = 120.0_f32;     // drag-to-mouse spring stiffness (increased from 40.0)
 
                 // Ensure velocity entries exist for all positioned nodes
                 for id in self.db.nodes.keys().copied() {
@@ -3124,10 +3148,14 @@ impl eframe::App for GraphApp {
                         let target = if count >= self.com_gravity_min_neighbors {
                             Pos2 { x: sum_x / (count as f32), y: sum_y / (count as f32) }
                         } else {
-                            center_world
+                            // Instead of global center, use a weak pull to keep things from flying away
+                            // but don't force a large centered grouping.
+                            center_world 
                         };
                         let dir = Vec2::new(target.x - pos.x, target.y - pos.y);
-                        *forces.entry(*id).or_insert(Vec2::ZERO) += dir * k_g;
+                        // Weaken global gravity pull to allow more spread
+                        let strength = if target == center_world { k_g * 0.5 } else { k_g };
+                        *forces.entry(*id).or_insert(Vec2::ZERO) += dir * strength;
                     }
                 }
 
