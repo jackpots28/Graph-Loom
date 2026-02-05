@@ -176,6 +176,8 @@ enum PickTarget {
     To,
     // Used when creating a brand-new node and pre-linking it to an existing node
     NewNodeTarget,
+    // Used when linking a note to an existing node
+    NoteLink,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -188,6 +190,7 @@ enum NewNodeRelDir {
 enum SidebarMode {
     Tooling,
     Query,
+    Notes,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -298,6 +301,8 @@ pub struct GraphApp {
     lod_enabled: bool,
     lod_label_min_zoom: f32,
     lod_hide_labels_node_threshold: usize,
+    // Maximum characters for node label display (truncation)
+    node_label_max_len: usize,
     // Edge label readability controls
     _edge_labels_enabled: bool,
     _edge_labels_only_on_hover: bool,
@@ -326,6 +331,20 @@ pub struct GraphApp {
     // Prevention for immediate re-open loop
     last_background_time: Option<Instant>,
     first_focused_observed: Option<Instant>,
+    // Notes tab state
+    notes_text: String,
+    notes_file_path: String,
+    notes_status: Option<String>,
+    notes_label: String,
+    notes_link_targets: HashSet<NodeId>,
+    notes_link_label: String,
+    prefs_notes_override_str: String,
+    // Pop-out note editor window
+    show_note_editor: bool,
+    // List of saved notes (file paths) for browsing
+    saved_notes_list: Vec<std::path::PathBuf>,
+    // Existing note node ID (if editing a note that's already in the graph)
+    notes_existing_node: Option<NodeId>,
 }
 
 impl GraphApp {
@@ -409,6 +428,7 @@ impl GraphApp {
             lod_enabled: true,
             lod_label_min_zoom: 0.7,
             lod_hide_labels_node_threshold: 200,
+            node_label_max_len: 15,
             _edge_labels_enabled: true,
             _edge_labels_only_on_hover: false,
             edge_label_min_zoom: 0.8,
@@ -428,6 +448,16 @@ impl GraphApp {
             api_running: false,
             last_background_time: None,
             first_focused_observed: None,
+            notes_text: String::new(),
+            notes_file_path: String::new(),
+            notes_status: None,
+            notes_label: String::from("Note"),
+            notes_link_targets: HashSet::new(),
+            notes_link_label: String::from("REFERENCES"),
+            prefs_notes_override_str: String::new(),
+            show_note_editor: false,
+            saved_notes_list: Vec::new(),
+            notes_existing_node: None,
         };
         // Apply settings to runtime toggles
         s.lod_enabled = s.app_settings.lod_enabled;
@@ -446,6 +476,20 @@ impl GraphApp {
             s.api_running = true;
         }
         s
+    }
+
+    fn find_note_node_by_file(&self, file_path: &str) -> Option<NodeId> {
+        if file_path.trim().is_empty() {
+            return None;
+        }
+        for (id, node) in &self.db.nodes {
+            if let Some(f) = node.metadata.get("file") {
+                if f == file_path {
+                    return Some(*id);
+                }
+            }
+        }
+        None
     }
 
     fn ensure_layout(&mut self, rect: Rect) {
@@ -905,6 +949,7 @@ impl GraphApp {
             lod_enabled: true,
             lod_label_min_zoom: 0.7,
             lod_hide_labels_node_threshold: 200,
+            node_label_max_len: 15,
             _edge_labels_enabled: true,
             _edge_labels_only_on_hover: false,
             edge_label_min_zoom: 0.8,
@@ -924,6 +969,16 @@ impl GraphApp {
             api_running: false,
             last_background_time: None,
             first_focused_observed: None,
+            notes_text: String::new(),
+            notes_file_path: String::new(),
+            notes_status: None,
+            notes_label: String::from("Note"),
+            notes_link_targets: HashSet::new(),
+            notes_link_label: String::from("REFERENCES"),
+            prefs_notes_override_str: String::new(),
+            show_note_editor: false,
+            saved_notes_list: Vec::new(),
+            notes_existing_node: None,
         };
         // Apply settings to runtime toggles
         s.lod_enabled = s.app_settings.lod_enabled;
@@ -1084,6 +1139,10 @@ impl GraphApp {
             None => String::new(),
         };
         self.prefs_api_log_override_str = match &self.prefs_edit.api_log_override {
+            Some(p) => p.display().to_string(),
+            None => String::new(),
+        };
+        self.prefs_notes_override_str = match &self.prefs_edit.notes_dir_override {
             Some(p) => p.display().to_string(),
             None => String::new(),
         };
@@ -1315,6 +1374,21 @@ impl eframe::App for GraphApp {
                             ui.label("Effective export default directory:");
                             ui.monospace(eff_export.display().to_string());
 
+                            ui.add_space(8.0);
+                            // Notes directory override
+                            ui.label("Notes directory (leave empty for ~/Documents/Graph-Loom/notes):");
+                            let _ = ui.text_edit_singleline(&mut self.prefs_notes_override_str);
+                            if ui.button("Clear to default").clicked() {
+                                self.prefs_notes_override_str.clear();
+                            }
+                            let eff_notes = if self.prefs_notes_override_str.trim().is_empty() {
+                                AppSettings::notes_default_dir()
+                            } else {
+                                std::path::PathBuf::from(self.prefs_notes_override_str.trim())
+                            };
+                            ui.label("Effective notes directory:");
+                            ui.monospace(eff_notes.display().to_string());
+
                             ui.separator();
                             ui.heading("Rendering / LOD");
                             ui.checkbox(&mut self.prefs_edit.lod_enabled, "Enable level-of-detail (LOD)");
@@ -1403,6 +1477,12 @@ impl eframe::App for GraphApp {
                                 None
                             } else {
                                 Some(std::path::PathBuf::from(self.prefs_api_log_override_str.trim()))
+                            };
+                            // Apply notes path
+                            self.prefs_edit.notes_dir_override = if self.prefs_notes_override_str.trim().is_empty() {
+                                None
+                            } else {
+                                Some(std::path::PathBuf::from(self.prefs_notes_override_str.trim()))
                             };
                             // Persist
                             match self.prefs_edit.save() {
@@ -1683,12 +1763,14 @@ impl eframe::App for GraphApp {
             let panel_id = match self.sidebar_mode {
                 SidebarMode::Tooling => "tooling_sidebar",
                 SidebarMode::Query => "query_sidebar",
+                SidebarMode::Notes => "notes_sidebar",
             };
             egui::SidePanel::left(panel_id)
                 .resizable(true)
                 .default_width(match self.sidebar_mode {
                     SidebarMode::Tooling => 260.0,
                     SidebarMode::Query => 300.0,
+                    SidebarMode::Notes => 320.0,
                 })
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -1702,6 +1784,28 @@ impl eframe::App for GraphApp {
                             self.deselect_all();
                             self.multi_select_active = false;
                             self.sidebar_mode = SidebarMode::Query;
+                        }
+                        let notes_sel = self.sidebar_mode == SidebarMode::Notes;
+                        if ui.selectable_label(notes_sel, "Notes").clicked() {
+                            self.deselect_all();
+                            self.multi_select_active = false;
+                            self.sidebar_mode = SidebarMode::Notes;
+                            // Refresh notes list on tab open
+                            let dir = self.app_settings.notes_dir();
+                            self.saved_notes_list.clear();
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                for entry in entries.flatten() {
+                                    let p = entry.path();
+                                    if p.is_file() {
+                                        if let Some(ext) = p.extension() {
+                                            if ext == "md" || ext == "txt" {
+                                                self.saved_notes_list.push(p);
+                                            }
+                                        }
+                                    }
+                                }
+                                self.saved_notes_list.sort();
+                            }
                         }
                     });
                     ui.separator();
@@ -1765,6 +1869,10 @@ impl eframe::App for GraphApp {
                             ui.label("Min zoom for labels");
                             ui.add(egui::Slider::new(&mut self.lod_label_min_zoom, 0.3..=1.5).clamping(egui::SliderClamping::Always));
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Max label length");
+                            ui.add(egui::DragValue::new(&mut self.node_label_max_len).range(5..=100));
+                        });
 
                         ui.separator();
                         ui.label("Relationship label readability");
@@ -1814,7 +1922,7 @@ impl eframe::App for GraphApp {
                                     ui.horizontal(|ui| {
                                         ui.label("Target:");
                                         let tgt_text = self.create_node_rel_target
-                                            .and_then(|id| self.db.nodes.get(&id).map(|_| format_short_node(&self.db, id)))
+                                            .and_then(|id| self.db.nodes.get(&id).map(|_| format_short_node(&self.db, id, self.node_label_max_len)))
                                             .unwrap_or_else(|| "<none>".into());
                                         ui.monospace(tgt_text);
                                     });
@@ -1894,7 +2002,7 @@ impl eframe::App for GraphApp {
                                 ui.label("From:");
                                 let key = self.create_rel_display_key.trim();
                                 let from_text = self.create_rel_from.map(|id| {
-                                    let base = format_short_node(&self.db, id);
+                                    let base = format_short_node(&self.db, id, self.node_label_max_len);
                                     if !key.is_empty() {
                                         if let Some(n) = self.db.nodes.get(&id) {
                                             if let Some(val) = n.metadata.get(key) {
@@ -1918,7 +2026,7 @@ impl eframe::App for GraphApp {
                                 ui.label("To:");
                                 let key = self.create_rel_display_key.trim();
                                 let to_text = self.create_rel_to.map(|id| {
-                                    let base = format_short_node(&self.db, id);
+                                    let base = format_short_node(&self.db, id, self.node_label_max_len);
                                     if !key.is_empty() {
                                         if let Some(n) = self.db.nodes.get(&id) {
                                             if let Some(val) = n.metadata.get(key) {
@@ -2474,6 +2582,81 @@ impl eframe::App for GraphApp {
                         }); // close Query ScrollArea
                     }); // close Query scope
                 } // close SidebarMode::Query
+                SidebarMode::Notes => {
+                    ui.heading("Notes");
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        // Action buttons
+                        ui.horizontal(|ui| {
+                            if ui.button("📝 New Note").clicked() {
+                                self.notes_text.clear();
+                                self.notes_file_path.clear();
+                                self.notes_label = String::from("Note");
+                                self.notes_link_targets.clear();
+                                self.notes_existing_node = None;
+                                self.notes_status = None;
+                                self.show_note_editor = true;
+                            }
+                            if ui.button("📂 Open Editor").clicked() {
+                                self.show_note_editor = true;
+                            }
+                        });
+                        
+                        ui.add_space(4.0);
+                        ui.small(format!("Notes folder: {}", self.app_settings.notes_dir().display()));
+                        
+                        // Refresh saved notes list button
+                        if ui.button("🔄 Refresh List").clicked() {
+                            let dir = self.app_settings.notes_dir();
+                            self.saved_notes_list.clear();
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                for entry in entries.flatten() {
+                                    let path = entry.path();
+                                    if path.is_file() {
+                                        if let Some(ext) = path.extension() {
+                                            if ext == "md" || ext == "txt" {
+                                                self.saved_notes_list.push(path);
+                                            }
+                                        }
+                                    }
+                                }
+                                self.saved_notes_list.sort();
+                            }
+                        }
+                        
+                        ui.separator();
+                        ui.label("Saved Notes:");
+                        
+                        if self.saved_notes_list.is_empty() {
+                            ui.small("No notes found. Click 'Refresh List' to scan.");
+                        } else {
+                            for path in self.saved_notes_list.clone() {
+                                let filename = path.file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                ui.horizontal(|ui| {
+                                    if ui.button(&filename).clicked() {
+                                        // Load and open in editor
+                                        if let Ok(content) = std::fs::read_to_string(&path) {
+                                            self.notes_text = content;
+                                            let path_str = path.display().to_string();
+                                            self.notes_file_path = path_str.clone();
+                                            self.notes_status = Some(format!("Loaded: {}", filename));
+                                            // Check if this note already exists as a node
+                                            self.notes_existing_node = self.find_note_node_by_file(&path_str);
+                                            self.show_note_editor = true;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        
+                        if let Some(status) = &self.notes_status {
+                            ui.separator();
+                            ui.small(status.clone());
+                        }
+                    });
+                } // close SidebarMode::Notes
             } // close match self.sidebar_mode
         }); // close SidePanel::show
     } // close if self.sidebar_open
@@ -2514,6 +2697,310 @@ impl eframe::App for GraphApp {
                         }
                     });
                 });
+        }
+
+        // Pop-out Note Editor Window
+        if self.show_note_editor {
+            let mut open = true;
+            egui::Window::new("📝 Note Editor")
+                .id(egui::Id::new("note_editor_window"))
+                .open(&mut open)
+                .resizable(true)
+                .default_width(500.0)
+                .default_height(400.0)
+                .show(ctx, |ui| {
+                    // Top toolbar
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 Save").clicked() {
+                            // Determine save path - similar to other note-taking apps:
+                            // - Empty path: auto-generate timestamped filename in default dir
+                            // - Just a filename: save to default notes directory
+                            // - Full path: use as-is
+                            let trimmed_path = self.notes_file_path.trim();
+                            let dir = self.app_settings.notes_dir();
+                            
+                            let path: std::path::PathBuf = if trimmed_path.is_empty() {
+                                // Auto-generate filename with timestamp in default directory
+                                match std::fs::create_dir_all(&dir) {
+                                    Err(e) => {
+                                        self.notes_status = Some(format!("Failed to create notes dir '{}': {}", dir.display(), e));
+                                        std::path::PathBuf::new()
+                                    }
+                                    Ok(()) => {
+                                        let now = time::OffsetDateTime::now_utc();
+                                        let fmt = time::macros::format_description!("[year][month][day]_[hour][minute][second]");
+                                        let stamp = now.format(&fmt).unwrap_or_else(|_| "note".into());
+                                        let filename = format!("{}.md", stamp);
+                                        let full_path = dir.join(&filename);
+                                        self.notes_file_path = full_path.display().to_string();
+                                        full_path
+                                    }
+                                }
+                            } else {
+                                let mut p = std::path::PathBuf::from(trimmed_path);
+                                // Default to .md extension if no extension specified
+                                if p.extension().is_none() {
+                                    let mut new_name = p.file_name().unwrap_or_default().to_os_string();
+                                    new_name.push(".md");
+                                    p.set_file_name(new_name);
+                                }
+                                // Validate that the path has a filename component
+                                if p.file_name().is_none() || p.file_name().map(|f| f.is_empty()).unwrap_or(true) {
+                                    self.notes_status = Some("Please specify a filename".into());
+                                    std::path::PathBuf::new()
+                                } else if !p.is_absolute() && p.parent().map(|par| par.as_os_str().is_empty()).unwrap_or(true) {
+                                    // Just a filename (no directory component) - save to default notes dir
+                                    match std::fs::create_dir_all(&dir) {
+                                        Err(e) => {
+                                            self.notes_status = Some(format!("Failed to create notes dir '{}': {}", dir.display(), e));
+                                            std::path::PathBuf::new()
+                                        }
+                                        Ok(()) => {
+                                            let full_path = dir.join(&p);
+                                            self.notes_file_path = full_path.display().to_string();
+                                            full_path
+                                        }
+                                    }
+                                } else {
+                                    // Full or relative path with directories - use as provided
+                                    p
+                                }
+                            };
+                            if !path.as_os_str().is_empty() {
+                                let mut dir_ok = true;
+                                if let Some(parent) = path.parent() {
+                                    if !parent.as_os_str().is_empty() {
+                                        if let Err(e) = std::fs::create_dir_all(parent) {
+                                            self.notes_status = Some(format!("Failed to create dir: {}", e));
+                                            dir_ok = false;
+                                        }
+                                    }
+                                }
+                                if dir_ok {
+                                match std::fs::write(&path, &self.notes_text) {
+                                Ok(_) => {
+                                    self.notes_status = Some(format!("✓ Saved to {}", path.display()));
+                                    // Refresh the notes list
+                                    let dir = self.app_settings.notes_dir();
+                                    self.saved_notes_list.clear();
+                                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                                        for entry in entries.flatten() {
+                                            let p = entry.path();
+                                            if p.is_file() {
+                                                if let Some(ext) = p.extension() {
+                                                    if ext == "md" || ext == "txt" {
+                                                        self.saved_notes_list.push(p);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        self.saved_notes_list.sort();
+                                    }
+                                }
+                                Err(e) => self.notes_status = Some(format!("Save failed: {}", e)),
+                                }
+                                }
+                            }
+                        }
+                        if ui.button("📄 New").clicked() {
+                            self.notes_text.clear();
+                            self.notes_file_path.clear();
+                            self.notes_label = String::from("Note");
+                            self.notes_link_targets.clear();
+                            self.notes_existing_node = None;
+                            self.notes_status = Some("New note created".into());
+                            // Refresh notes list on new note creation
+                            let dir = self.app_settings.notes_dir();
+                            self.saved_notes_list.clear();
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                for entry in entries.flatten() {
+                                    let p = entry.path();
+                                    if p.is_file() {
+                                        if let Some(ext) = p.extension() {
+                                            if ext == "md" || ext == "txt" {
+                                                self.saved_notes_list.push(p);
+                                            }
+                                        }
+                                    }
+                                }
+                                self.saved_notes_list.sort();
+                            }
+                        }
+                    });
+                    
+                    // File path
+                    ui.horizontal(|ui| {
+                        ui.label("File:");
+                        ui.add(egui::TextEdit::singleline(&mut self.notes_file_path).desired_width(300.0));
+                    });
+                    if self.notes_file_path.trim().is_empty() {
+                        ui.small(format!("Will save to: {}", self.app_settings.notes_dir().display()));
+                    }
+                    
+                    if let Some(status) = &self.notes_status {
+                        ui.colored_label(
+                            if status.starts_with('✓') { Color32::from_rgb(100, 200, 100) } else { Color32::GRAY },
+                            status.clone()
+                        );
+                    }
+                    
+                    ui.separator();
+                    
+                    // Add to Graph section
+                    ui.collapsing("🔗 Add to Graph", |ui| {
+                        // Check if this note already exists as a node
+                        let existing_node = self.find_note_node_by_file(&self.notes_file_path);
+                        self.notes_existing_node = existing_node;
+                        
+                        if let Some(existing_id) = existing_node {
+                            ui.colored_label(Color32::from_rgb(100, 200, 100), 
+                                format!("Note node exists ({})", format_short_node(&self.db, existing_id, self.node_label_max_len)));
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Node Label:");
+                            ui.text_edit_singleline(&mut self.notes_label);
+                        });
+
+                        ui.separator();
+                        ui.label("Link to nodes:");
+                        
+                        // Show currently selected link targets
+                        if self.notes_link_targets.is_empty() {
+                            ui.small("No nodes selected");
+                        } else {
+                            let targets: Vec<NodeId> = self.notes_link_targets.iter().copied().collect();
+                            let mut to_remove: Option<NodeId> = None;
+                            for target_id in &targets {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format_short_node(&self.db, *target_id, self.node_label_max_len));
+                                    if ui.small_button("✕").clicked() {
+                                        to_remove = Some(*target_id);
+                                    }
+                                });
+                            }
+                            if let Some(id) = to_remove {
+                                self.notes_link_targets.remove(&id);
+                            }
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            let picking = matches!(self.pick_target, Some(PickTarget::NoteLink));
+                            let txt = if picking { "Cancel Pick" } else { "Pick Node" };
+                            if ui.button(txt).clicked() {
+                                self.pick_target = if picking { None } else { Some(PickTarget::NoteLink) };
+                            }
+                            if ui.button("Clear All").clicked() {
+                                self.notes_link_targets.clear();
+                            }
+                        });
+                        if matches!(self.pick_target, Some(PickTarget::NoteLink)) {
+                            ui.colored_label(Color32::YELLOW, "Click nodes on canvas to add links (click again to remove)");
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Relationship:");
+                            ui.text_edit_singleline(&mut self.notes_link_label);
+                        });
+
+                        ui.add_space(4.0);
+                        
+                        let button_text = if existing_node.is_some() { "🔄 Update Note Node" } else { "➕ Add Note to Graph" };
+                        if ui.button(button_text).clicked() {
+                            let label = if self.notes_label.trim().is_empty() {
+                                "Note".to_string()
+                            } else {
+                                self.notes_label.trim().to_string()
+                            };
+
+                            let mut meta = HashMap::new();
+                            // Only store file link and title, not the full content
+                            if !self.notes_file_path.trim().is_empty() {
+                                meta.insert("file".to_string(), self.notes_file_path.clone());
+                            }
+                            // Extract title from first line, or fall back to just the filename (not full path)
+                            let mut title_set = false;
+                            if let Some(first_line) = self.notes_text.lines().next() {
+                                let title = first_line.trim().trim_start_matches('#').trim();
+                                if !title.is_empty() {
+                                    meta.insert("title".to_string(), title.to_string());
+                                    title_set = true;
+                                }
+                            }
+                            if !title_set && !self.notes_file_path.trim().is_empty() {
+                                // Use just the filename as title, not the full path
+                                if let Some(filename) = std::path::Path::new(&self.notes_file_path).file_name() {
+                                    meta.insert("title".to_string(), filename.to_string_lossy().to_string());
+                                }
+                            }
+
+                            let node_id = if let Some(existing_id) = existing_node {
+                                // Update existing node
+                                if let Some(node) = self.db.nodes.get_mut(&existing_id) {
+                                    node.label = label;
+                                    node.metadata = meta;
+                                }
+                                existing_id
+                            } else {
+                                // Create new node
+                                let new_id = self.db.add_node(label, meta);
+                                self.re_cluster_pending = true;
+                                if let Some(r) = self.last_canvas_rect {
+                                    let idx = self.node_positions.len();
+                                    let pos = golden_spiral_position(r.center(), idx as u32, r);
+                                    self.node_positions.insert(new_id, pos);
+                                }
+                                new_id
+                            };
+
+                            // Add relationships to all selected targets (skip if already exists)
+                            let rel_label = if self.notes_link_label.trim().is_empty() {
+                                "REFERENCES".to_string()
+                            } else {
+                                self.notes_link_label.trim().to_string()
+                            };
+                            
+                            for target_id in &self.notes_link_targets {
+                                // Check if relationship already exists
+                                let rel_exists = self.db.relationships.values().any(|r| {
+                                    r.from_node == node_id && r.to_node == *target_id && r.label == rel_label
+                                });
+                                if !rel_exists && *target_id != node_id {
+                                    let _ = self.db.add_relationship(node_id, *target_id, rel_label.clone(), HashMap::new());
+                                }
+                            }
+
+                            // Reset pick state and clear link targets after update
+                            self.pick_target = None;
+                            self.notes_link_targets.clear();
+                            
+                            // Don't open node window after update - just mark dirty and show status
+                            self.mark_dirty();
+                            
+                            let status_msg = if existing_node.is_some() {
+                                "✓ Note node updated".to_string()
+                            } else {
+                                "✓ Note added to graph".to_string()
+                            };
+                            self.notes_status = Some(status_msg);
+                        }
+                    });
+                    
+                    ui.separator();
+                    
+                    // Main text editor area
+                    ui.label("Content:");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.notes_text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(15)
+                                .font(egui::TextStyle::Monospace)
+                        );
+                    });
+                });
+            if !open {
+                self.show_note_editor = false;
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2711,53 +3198,6 @@ impl eframe::App for GraphApp {
                 painter.line_segment([a, b], stroke);
             }
 
-                    // Relationship label at midpoint with improved LOD visibility and pill background
-                    let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
-                    let dir = Vec2::new(b.x - a.x, b.y - a.y);
-                    let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
-
-                    // Visibility: only show relationship label text when hovering over a connected node
-                    let show_label = incident_hover;
-
-                    if show_label && len > f32::EPSILON {
-                        // Perpendicular and tangential offsets, alternating per edge for separation
-                        let n = Vec2::new(-dir.y / len, dir.x / len);
-                        let t = Vec2::new(dir.x / len, dir.y / len);
-                        let mut seed = rel.from_node.as_u128() ^ (rel.to_node.as_u128().rotate_left(17)) ^ rel.id.as_u128();
-                        seed ^= seed >> 33;
-                        let side = if (seed & 1) == 0 { 1.0 } else { -1.0 };
-                        let lane = ((seed >> 1) & 3) as i32 - 1; // -1,0,1,2 → center-ish shift
-                        let perp_mag = (8.0 * self.zoom).clamp(4.0, 16.0);
-                        let tan_mag = (lane as f32) * 4.0 * self.zoom;
-                        let offset = n * (perp_mag * side as f32) + t * tan_mag;
-
-                        // Text styling
-                        let font = egui::FontId::proportional((12.0 * self.zoom).clamp(8.0, 16.0));
-                        let txt_color = if is_sel { Color32::from_rgb(30, 30, 30) } else { Color32::from_rgb(20, 20, 20) };
-                        let pill_fill = if is_sel {
-                            Color32::from_rgba_premultiplied(255, 220, 120, 220)
-                        } else if is_qsel || incident_hover {
-                            Color32::from_rgba_premultiplied(180, 235, 255, self.edge_label_bg_alpha)
-                        } else {
-                            Color32::from_rgba_premultiplied(245, 245, 245, self.edge_label_bg_alpha)
-                        };
-                        let _outline = Color32::from_rgba_premultiplied(0, 0, 0, 120);
-
-                        // Layout the text to size the pill
-                        let galley = ui.painter().layout_no_wrap(rel.label.clone(), font.clone(), txt_color);
-                        let pad = Vec2::new(6.0 * self.zoom, 3.0 * self.zoom);
-                        let pill_size = galley.size() + pad * 2.0;
-                        let center = mid + offset;
-                        let rect = Rect::from_center_size(center, pill_size);
-                        // Halo: draw a slightly larger translucent rect behind
-                        let halo_rect = Rect::from_center_size(center, pill_size + Vec2::new(4.0, 2.0));
-                        let rounding = 6.0 * self.zoom;
-                        painter.rect_filled(halo_rect, rounding, Color32::from_rgba_premultiplied(0, 0, 0, 25));
-                        // Pill background (optionally could add outline if API supports it)
-                        painter.rect_filled(rect, rounding, pill_fill);
-                        // Draw text centered
-                        painter.galley(center - galley.size() * 0.5, galley, txt_color);
-                    }
                 }
             }
 
@@ -2800,7 +3240,7 @@ impl eframe::App for GraphApp {
                 // Hover tooltip: show readable details without cluttering the canvas
                 resp.on_hover_ui(|ui| {
                     ui.label(egui::RichText::new(
-                        format_short_node(&self.db, id)
+                        format_short_node(&self.db, id, self.node_label_max_len)
                     ).strong());
                     ui.monospace(format!("UUID: {}", id));
                     // Show degree (incident edges) and up to 5 properties
@@ -2819,6 +3259,35 @@ impl eframe::App for GraphApp {
                             shown += 1;
                         }
                         if n.metadata.len() > 5 { ui.small(format!("(+{} more)", n.metadata.len() - 5)); }
+                    }
+                    // Show relationships
+                    let mut rels: Vec<(bool, String, String)> = Vec::new(); // (is_outgoing, rel_label, other_node_name)
+                    for rel in self.db.relationships.values() {
+                        if rel.from_node == id {
+                            let other_name = format_short_node(&self.db, rel.to_node, self.node_label_max_len);
+                            rels.push((true, rel.label.clone(), other_name));
+                        } else if rel.to_node == id {
+                            let other_name = format_short_node(&self.db, rel.from_node, self.node_label_max_len);
+                            rels.push((false, rel.label.clone(), other_name));
+                        }
+                    }
+                    if !rels.is_empty() {
+                        rels.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+                        ui.separator();
+                        ui.small("Relationships:");
+                        let max_show = 6;
+                        for (i, (is_out, lbl, other)) in rels.iter().enumerate() {
+                            if i >= max_show { break; }
+                            let arrow = if *is_out { "→" } else { "←" };
+                            let arrow_color = if *is_out { Color32::from_rgb(100, 200, 100) } else { Color32::from_rgb(255, 180, 80) };
+                            ui.horizontal(|ui| {
+                                ui.colored_label(arrow_color, arrow);
+                                ui.small(format!("{} {}", lbl, other));
+                            });
+                        }
+                        if rels.len() > max_show {
+                            ui.small(format!("… and {} more", rels.len() - max_show));
+                        }
                     }
                 });
 
@@ -2854,7 +3323,7 @@ impl eframe::App for GraphApp {
                     (!many && zoom_ok) || is_hover || is_query || is_sel
                 };
                 if show_label {
-                    let text = format_short_node(&self.db, id);
+                    let text = format_short_node(&self.db, id, self.node_label_max_len);
                     let label_color = GraphApp::color_for_label(&node.label);
                     let pos_text = pos_screen + Vec2::new(0.0, -node_radius_draw - 4.0);
                     // multi-direction halo for readability
@@ -2916,6 +3385,15 @@ impl eframe::App for GraphApp {
                                 self.pending_new_node_for_link = None;
                             }
                             self.pick_target = None;
+                        }
+                        PickTarget::NoteLink => {
+                            // Toggle the target node in the link targets set
+                            if self.notes_link_targets.contains(&id) {
+                                self.notes_link_targets.remove(&id);
+                            } else {
+                                self.notes_link_targets.insert(id);
+                            }
+                            // Don't clear pick_target - allow selecting multiple nodes
                         }
                     }
                 } else if self.multi_select_active {
@@ -3053,7 +3531,7 @@ impl eframe::App for GraphApp {
                 let repulse_k = 45.0_f32;    // repulsion strength (increased slightly)
                 let max_speed = 2000.0_f32;  // clamp velocity magnitude (increased from 1000.0)
                 let max_step = 25.0_f32;     // clamp displacement per frame (increased from 10.0)
-                let mouse_k = 120.0_f32;     // drag-to-mouse spring stiffness (increased from 40.0)
+                let _mouse_k = 120.0_f32;    // (unused; kept for reference if spring-drag is re-enabled)
 
                 // Ensure velocity entries exist for all positioned nodes
                 for id in self.db.nodes.keys().copied() {
@@ -3202,17 +3680,21 @@ impl eframe::App for GraphApp {
                     }
                 }
 
-                // Soft drag: apply a spring pulling the dragged node towards the mouse in world space
-                // If multiple nodes are selected, dragging one drags them all together by applying
-                // the same translation force vector to each selected node.
+                // Direct drag: move dragged nodes directly to follow the mouse for snappy response
+                // (like Obsidian). This bypasses physics for the dragged unit.
                 if let Some(drag_id) = self.dragging {
                     if let Some(mouse_pos_screen) = ui.input(|i| i.pointer.latest_pos()) {
                         let mouse_world = from_screen(mouse_pos_screen);
                         if let Some(p_drag) = self.node_positions.get(&drag_id).copied() {
-                            let dir = Vec2::new(mouse_world.x - p_drag.x, mouse_world.y - p_drag.y);
-                            // Apply force to all nodes in the unit
+                            let delta = Vec2::new(mouse_world.x - p_drag.x, mouse_world.y - p_drag.y);
+                            // Move all nodes in the dragged unit by the same delta
                             for nid in &dragged_unit {
-                                *forces.entry(*nid).or_insert(Vec2::ZERO) += dir * mouse_k;
+                                if let Some(p) = self.node_positions.get_mut(nid) {
+                                    p.x += delta.x;
+                                    p.y += delta.y;
+                                }
+                                // Zero velocity for dragged nodes to prevent drift after release
+                                self.node_velocities.insert(*nid, Vec2::ZERO);
                             }
                         }
                     }
@@ -3273,7 +3755,7 @@ impl eframe::App for GraphApp {
                 let mut to_remove_keys: Vec<String> = Vec::new();
                 let mut upsert_kv: Option<(String, String)> = None;
                 let mut delete_node = false;
-
+                let mut open_note_file: Option<String> = None;
                 egui::Window::new(format!("Node {} Details", id))
                     .id(egui::Id::new(("node_details", id)))
                     .open(&mut open)
@@ -3300,7 +3782,14 @@ impl eframe::App for GraphApp {
                                 ui.horizontal(|ui| {
                                     ui.label(&k);
                                     ui.label(":");
-                                    ui.monospace(&v);
+                                    // Make "file" metadata clickable to open note
+                                    if k == "file" && (v.ends_with(".md") || v.ends_with(".txt")) {
+                                        if ui.link(&v).on_hover_text("Click to open note").clicked() {
+                                            open_note_file = Some(v.clone());
+                                        }
+                                    } else {
+                                        ui.monospace(&v);
+                                    }
                                     if ui.button("Remove").clicked() { to_remove_keys.push(k.clone()); }
                                 });
                             }
@@ -3319,6 +3808,37 @@ impl eframe::App for GraphApp {
                                 }
                             }
                         });
+                        // Relationships section (collapsible, hidden by default)
+                        ui.separator();
+                        egui::CollapsingHeader::new("Relationships")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let mut rel_entries: Vec<(String, String, bool)> = Vec::new(); // (label, target_name, is_outgoing)
+                                for rel in self.db.relationships.values() {
+                                    if rel.from_node == id {
+                                        let target_name = format_short_node(&self.db, rel.to_node, self.node_label_max_len);
+                                        rel_entries.push((rel.label.clone(), target_name, true));
+                                    } else if rel.to_node == id {
+                                        let source_name = format_short_node(&self.db, rel.from_node, self.node_label_max_len);
+                                        rel_entries.push((rel.label.clone(), source_name, false));
+                                    }
+                                }
+                                if rel_entries.is_empty() {
+                                    ui.label("<no relationships>");
+                                } else {
+                                    rel_entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                                    for (label, target, is_out) in &rel_entries {
+                                        ui.horizontal(|ui| {
+                                            let arrow = if *is_out { "→" } else { "←" };
+                                            let arrow_color = if *is_out { Color32::from_rgb(120, 220, 160) } else { Color32::from_rgb(220, 160, 120) };
+                                            ui.colored_label(arrow_color, arrow);
+                                            ui.label(label);
+                                            ui.monospace(target);
+                                        });
+                                    }
+                                }
+                            });
+
                         ui.separator();
                         if ui.button(egui::RichText::new("Delete Node").color(Color32::RED)).clicked() {
                             delete_node = true;
@@ -3339,7 +3859,20 @@ impl eframe::App for GraphApp {
                     if self.db.remove_node(id) {
                         self.node_positions.remove(&id);
                         if self.selected == Some(SelectedItem::Node(id)) { self.selected = None; }
-                        self.re_cluster_pending = true; self.mark_dirty();
+                        self.mark_dirty();
+                    }
+                }
+                // Open note file in editor if clicked
+                if let Some(file_path) = open_note_file {
+                    let path = std::path::PathBuf::from(&file_path);
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        self.notes_text = content;
+                        self.notes_file_path = file_path;
+                        self.notes_status = Some(format!("Loaded: {}", path.file_name().unwrap_or_default().to_string_lossy()));
+                        self.show_note_editor = true;
+                    } else {
+                        self.notes_status = Some(format!("Failed to load: {}", file_path));
+                        self.show_note_editor = true;
                     }
                 }
                 if !open { nodes_to_close.push(id); }
@@ -3439,7 +3972,7 @@ impl eframe::App for GraphApp {
                 if delete_rel {
                     if self.db.remove_relationship(rid) {
                         if self.selected == Some(SelectedItem::Rel(rid)) { self.selected = None; }
-                        self.re_cluster_pending = true; self.mark_dirty();
+                        self.mark_dirty();
                     }
                 }
                 if !open { rels_to_close.push(rid); }
@@ -3588,34 +4121,28 @@ fn _short_uuid(id: Uuid) -> String {
     s.chars().rev().take(8).collect::<Vec<char>>().into_iter().rev().collect()
 }
 
-fn format_short_node(db: &GraphDatabase, id: NodeId) -> String {
+fn format_short_node(db: &GraphDatabase, id: NodeId, max_len: usize) -> String {
     // Render-friendly node caption without UUID to improve readability on canvas.
-    // Prefer a human-friendly metadata field if present.
+    // Use the shortest non-empty metadata string value; fall back to label only if no metadata.
     if let Some(n) = db.nodes.get(&id) {
-        // Prefer commonly used human-readable keys
-        if let Some(name) = n.metadata.get("name").filter(|s| !s.is_empty()) {
-            return name.clone();
+        // Find the shortest non-empty metadata value
+        let shortest = n.metadata.values()
+            .filter(|s| !s.is_empty())
+            .min_by_key(|s| s.len());
+        
+        let text = if let Some(val) = shortest {
+            val.clone()
+        } else {
+            // Fallback to label only when no metadata exists
+            n.label.clone()
+        };
+        
+        // Truncate if longer than max_len
+        if max_len > 0 && text.chars().count() > max_len {
+            let truncated: String = text.chars().take(max_len).collect();
+            return format!("{}…", truncated);
         }
-        if let Some(title) = n.metadata.get("title").filter(|s| !s.is_empty()) {
-            return title.clone();
-        }
-        if let Some(keyword) = n.metadata.get("keyword").filter(|s| !s.is_empty()) {
-            return keyword.clone();
-        }
-        // Requirement: Use one of the values from a node's metadata as the rendered name
-        // If no preferred key exists but metadata has entries, use a deterministic choice:
-        // pick the first non-empty value by alphabetical key order.
-        if !n.metadata.is_empty() {
-            let mut keys: Vec<&String> = n.metadata.keys().collect();
-            keys.sort();
-            for k in keys {
-                if let Some(val) = n.metadata.get(k).filter(|s| !s.is_empty()) {
-                    return val.clone();
-                }
-            }
-        }
-        // Fallback to label only (no short uuid)
-        return n.label.clone();
+        return text;
     }
     // Unknown node fallback
     "<unknown>".to_string()
