@@ -35,6 +35,9 @@ pub struct AppSettings {
     // Whether to continue running in background when GUI window is closed
     #[serde(default)]
     pub background_on_close: bool,
+    // Default directory for saving notes
+    #[serde(default)]
+    pub notes_dir_override: Option<PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -53,6 +56,7 @@ impl Default for AppSettings {
             grpc_enabled: false,
             grpc_port: Self::default_grpc_port(),
             background_on_close: false,
+            notes_dir_override: None,
         }
     }
 }
@@ -198,5 +202,32 @@ impl AppSettings {
     pub fn api_log_dir(&self) -> PathBuf {
         if let Some(p) = &self.api_log_override { return p.clone(); }
         Self::api_log_default_dir()
+    }
+
+    /// Default notes directory when no override is set: ~/Documents/Graph-Loom/notes
+    pub fn notes_default_dir() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("~"));
+            return home.join("Documents").join("Graph-Loom").join("notes");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(userprofile) = std::env::var("USERPROFILE") {
+                return PathBuf::from(userprofile).join("Documents").join("Graph-Loom").join("notes");
+            }
+            return PathBuf::from("Graph-Loom").join("notes");
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("~"));
+            return home.join("Documents").join("Graph-Loom").join("notes");
+        }
+    }
+
+    /// Effective notes directory honoring user override or falling back to default.
+    pub fn notes_dir(&self) -> PathBuf {
+        if let Some(p) = &self.notes_dir_override { return p.clone(); }
+        Self::notes_default_dir()
     }
 }
