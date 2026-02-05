@@ -101,7 +101,9 @@ fn _split_statements(input: &str) -> Vec<String> {
 }
 
 pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome> {
-    let trimmed = query.trim();
+    // Normalize line endings: convert CRLF to LF and remove stray CR
+    let normalized = query.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("empty query"));
     }
