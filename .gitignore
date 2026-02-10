@@ -17,3 +17,5 @@
 /WindowsInstaller/output
 
 CypherStyleSpec.md
+/AppleInstaller/build/
+/AppleInstaller/output/
