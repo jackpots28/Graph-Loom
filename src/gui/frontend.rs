@@ -345,6 +345,10 @@ pub struct GraphApp {
     saved_notes_list: Vec<std::path::PathBuf>,
     // Existing note node ID (if editing a note that's already in the graph)
     notes_existing_node: Option<NodeId>,
+    // Confirmation dialog for note deletion
+    confirm_note_delete: bool,
+    // Path of note pending deletion
+    note_delete_path: Option<std::path::PathBuf>,
 }
 
 impl GraphApp {
@@ -458,6 +462,8 @@ impl GraphApp {
             show_note_editor: false,
             saved_notes_list: Vec::new(),
             notes_existing_node: None,
+            confirm_note_delete: false,
+            note_delete_path: None,
         };
         // Apply settings to runtime toggles
         s.lod_enabled = s.app_settings.lod_enabled;
@@ -979,6 +985,8 @@ impl GraphApp {
             show_note_editor: false,
             saved_notes_list: Vec::new(),
             notes_existing_node: None,
+            confirm_note_delete: false,
+            note_delete_path: None,
         };
         // Apply settings to runtime toggles
         s.lod_enabled = s.app_settings.lod_enabled;
@@ -2647,6 +2655,11 @@ impl eframe::App for GraphApp {
                                             self.show_note_editor = true;
                                         }
                                     }
+                                    // Delete button for each note in the list
+                                    if ui.small_button("🗑").on_hover_text("Delete note").clicked() {
+                                        self.note_delete_path = Some(path.clone());
+                                        self.confirm_note_delete = true;
+                                    }
                                 });
                             }
                         }
@@ -2660,6 +2673,63 @@ impl eframe::App for GraphApp {
             } // close match self.sidebar_mode
         }); // close SidePanel::show
     } // close if self.sidebar_open
+
+        // Confirmation modal for note delete
+        if self.confirm_note_delete {
+            egui::Window::new("Confirm Delete Note")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    let filename = self.note_delete_path.as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "this note".to_string());
+                    ui.label(format!("Delete '{}'?", filename));
+                    ui.label("This will delete the file and remove any associated graph node.");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button(egui::RichText::new("Delete").color(Color32::RED)).clicked() {
+                            if let Some(path) = self.note_delete_path.take() {
+                                let path_str = path.display().to_string();
+                                // Delete the associated graph node if it exists
+                                if let Some(node_id) = self.find_note_node_by_file(&path_str) {
+                                    if self.db.remove_node(node_id) {
+                                        self.node_positions.remove(&node_id);
+                                        self.open_node_windows.remove(&node_id);
+                                        self.mark_dirty();
+                                    }
+                                    // Prune relationship windows
+                                    self.open_rel_windows.retain(|rid| self.db.relationships.contains_key(rid));
+                                }
+                                // Delete the file
+                                match std::fs::remove_file(&path) {
+                                    Ok(_) => {
+                                        self.notes_status = Some(format!("✓ Deleted: {}", filename));
+                                        // Clear editor and close window if this was the open note
+                                        if self.notes_file_path == path_str {
+                                            self.notes_text.clear();
+                                            self.notes_file_path.clear();
+                                            self.notes_existing_node = None;
+                                            self.show_note_editor = false;
+                                        }
+                                        // Refresh notes list
+                                        self.saved_notes_list.retain(|p| p != &path);
+                                    }
+                                    Err(e) => {
+                                        self.notes_status = Some(format!("Delete failed: {}", e));
+                                    }
+                                }
+                            }
+                            self.confirm_note_delete = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.note_delete_path = None;
+                            self.confirm_note_delete = false;
+                        }
+                    });
+                });
+        }
 
         // Confirmation modal for mass delete
         if self.confirm_mass_delete {
@@ -2826,6 +2896,15 @@ impl eframe::App for GraphApp {
                                 self.saved_notes_list.sort();
                             }
                         }
+                        // Delete button - only enabled if a file is loaded
+                        let can_delete = !self.notes_file_path.trim().is_empty() 
+                            && std::path::Path::new(&self.notes_file_path).exists();
+                        ui.add_enabled_ui(can_delete, |ui| {
+                            if ui.button("🗑 Delete").on_hover_text("Delete this note").clicked() {
+                                self.note_delete_path = Some(std::path::PathBuf::from(&self.notes_file_path));
+                                self.confirm_note_delete = true;
+                            }
+                        });
                     });
                     
                     // File path
@@ -2996,6 +3075,19 @@ impl eframe::App for GraphApp {
                                 .desired_rows(15)
                                 .font(egui::TextStyle::Monospace)
                         );
+                    });
+                    
+                    // Word/character/line count (Obsidian-like stats)
+                    ui.separator();
+                    let char_count = self.notes_text.len();
+                    let word_count = self.notes_text.split_whitespace().count();
+                    let line_count = self.notes_text.lines().count().max(1);
+                    ui.horizontal(|ui| {
+                        ui.small(format!("{} words", word_count));
+                        ui.separator();
+                        ui.small(format!("{} characters", char_count));
+                        ui.separator();
+                        ui.small(format!("{} lines", line_count));
                     });
                 });
             if !open {
