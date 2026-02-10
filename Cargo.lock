@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "graph_loom"
-version = "1.9.2"
+version = "1.11.1"
 dependencies = [
  "actix",
  "actix-web",

@@ -1,6 +1,6 @@
 [package]
 name = "graph_loom"
-version = "1.9.2"
+version = "1.11.1"
 edition = "2024"
 
 authors = ["Jack Sims jack.m.sims@protonmail.com"]
