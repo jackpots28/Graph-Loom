@@ -1,6 +1,6 @@
 [package]
 name = "graph_loom"
-version = "1.11.1"
+version = "1.15.1"
 edition = "2024"
 
 authors = ["Jack Sims jack.m.sims@protonmail.com"]
@@ -61,6 +61,9 @@ prost = { version = "0.13", optional = true }
 prost-derive = { version = "0.13", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tray-icon = "0.19"
+
+# Storage - SQLite backend for enterprise persistence
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Windows-specific dependencies for foregrounding
 [target.'cfg(target_os = "windows")'.dependencies]
