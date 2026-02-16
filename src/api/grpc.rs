@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use tonic::{transport::Server, Request, Response, Status};
 
 use crate::api::{get_request_sender, ApiRequest};
+use crate::api::auth::{AuthConfig, AuthContext, AuthResult, validate_api_key};
 use crate::gql::query_interface::QueryResultRow;
 use crate::persistence::settings::AppSettings;
 
@@ -12,9 +13,19 @@ pub mod proto {
 use proto::graph_query_server::{GraphQuery, GraphQueryServer};
 use proto::{QueryRequest, QueryResponse, QueryRow, Node, Relationship};
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct MyGraphQuery {
     api_key: Option<String>,
+    auth_config: AuthConfig,
+}
+
+impl Default for MyGraphQuery {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            auth_config: AuthConfig::default(),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -23,15 +34,24 @@ impl GraphQuery for MyGraphQuery {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        if let Some(required_key) = &self.api_key {
-            let metadata = request.metadata();
-            match metadata.get("x-api-key") {
-                Some(key) if key == required_key => {}
-                _ => return Err(Status::unauthenticated("invalid or missing api key")),
-            }
-        }
+        // Authenticate using the auth module
+        let provided_key = request.metadata().get("x-api-key")
+            .and_then(|v| v.to_str().ok());
+        
+        let auth_ctx = match validate_api_key(provided_key, self.api_key.as_deref(), &self.auth_config) {
+            AuthResult::Success(ctx) => ctx,
+            AuthResult::Disabled => AuthContext::anonymous(),
+            AuthResult::InvalidCredentials => return Err(Status::unauthenticated("invalid api key")),
+            AuthResult::MissingCredentials => return Err(Status::unauthenticated("missing api key")),
+            AuthResult::Expired => return Err(Status::unauthenticated("token expired")),
+        };
 
         let req = request.into_inner();
+        
+        // Check if user has permission to execute this query
+        if !auth_ctx.can_execute_query(&req.query) {
+            return Err(Status::permission_denied("insufficient permissions for this query"));
+        }
         let sender = match get_request_sender() {
             Some(s) => s.clone(),
             None => return Err(Status::unavailable("broker not ready")),
@@ -117,6 +137,7 @@ pub fn start_grpc_server(cfg: &AppSettings) -> anyhow::Result<()> {
     let addr = format!("{}:{}", cfg.api_bind_addr, cfg.grpc_port).parse()?;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let api_key = cfg.api_key.clone();
+    let auth_config = cfg.auth_config.clone();
 
     {
         let mut state = GRPC_SERVER_STATE.lock().unwrap();
@@ -136,7 +157,7 @@ pub fn start_grpc_server(cfg: &AppSettings) -> anyhow::Result<()> {
             };
 
         rt.block_on(async {
-            let service = MyGraphQuery { api_key };
+            let service = MyGraphQuery { api_key, auth_config };
             if let Err(e) = Server::builder()
                 .add_service(GraphQueryServer::new(service))
                 .serve_with_shutdown(addr, async {

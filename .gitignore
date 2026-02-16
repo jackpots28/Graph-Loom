@@ -1,15 +1,29 @@
+# IDE and Language specific dirs
 /target
 /.idea
+/examples/python_client/.idea
+
+# Misc files and filetypes
+*.ipynb
+*__pycache__*
+.DS_Store
+CypherStyleSpec.md
+
+# Icons for App installation - to include
 !/assets/.gitkeep
 !/assets/logs/.gitkeep
 !/assets/AppSet.iconset/.gitkeep
 !/assets/AppSet.iconset
 !/assets/AppSet.icns
 
+# Ignore all other assets
 /assets
 /assets/logs
 
+# Windows centric installer dirs
 /WindowsInstaller/icon
 /WindowsInstaller/output
 
-CypherStyleSpec.md
+# Apple centric installer dirs
+/AppleInstaller/build/
+/AppleInstaller/output/

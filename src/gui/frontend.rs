@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use uuid::Uuid;
+use rayon::prelude::*;
 
 use crate::graph_utils::graph::{GraphDatabase, NodeId};
 use crate::persistence::persist::{self, AppStateFile};
-use crate::persistence::settings::AppSettings;
+use crate::persistence::settings::{AppSettings, LlmProvider};
 use crate::gql::query_interface::{self, QueryResultRow};
 use crate::api::{self, ApiRequest};
 
@@ -175,6 +176,8 @@ enum PickTarget {
     To,
     // Used when creating a brand-new node and pre-linking it to an existing node
     NewNodeTarget,
+    // Used when linking a note to an existing node
+    NoteLink,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -187,12 +190,15 @@ enum NewNodeRelDir {
 enum SidebarMode {
     Tooling,
     Query,
+    Notes,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PrefsTab {
     App,
     Api,
+    Llm,
+    Embeddings,
 }
 
 pub struct GraphApp {
@@ -287,22 +293,11 @@ pub struct GraphApp {
     _cluster_converge_enabled: bool,
     _cluster_converge_threshold: usize,
     _cluster_converge_strength: f32,
-    gravity_enabled: bool,
-    gravity_strength: f32,
-    // Center-of-mass (COM) local gravity settings
-    com_gravity_radius: f32,         // within this radius, prefer attraction to local COM
-    com_gravity_min_neighbors: usize, // minimum nearby nodes to switch from global to local COM
-    hub_repulsion_scale: f32,
-    // Level-of-detail (LOD) rendering controls
-    lod_enabled: bool,
-    lod_label_min_zoom: f32,
-    lod_hide_labels_node_threshold: usize,
+    // Maximum characters for node label display (truncation)
+    node_label_max_len: usize,
     // Edge label readability controls
     _edge_labels_enabled: bool,
     _edge_labels_only_on_hover: bool,
-    edge_label_min_zoom: f32,
-    edge_label_count_threshold: usize,
-    edge_label_bg_alpha: u8,
     // Focus/hover state for dimming/highlighting
     hover_node: Option<NodeId>,
     // Transient zoom HUD (show current zoom briefly when scrolling)
@@ -325,6 +320,24 @@ pub struct GraphApp {
     // Prevention for immediate re-open loop
     last_background_time: Option<Instant>,
     first_focused_observed: Option<Instant>,
+    // Notes tab state
+    notes_text: String,
+    notes_file_path: String,
+    notes_status: Option<String>,
+    notes_label: String,
+    notes_link_targets: HashSet<NodeId>,
+    notes_link_label: String,
+    prefs_notes_override_str: String,
+    // Pop-out note editor window
+    show_note_editor: bool,
+    // List of saved notes (file paths) for browsing
+    saved_notes_list: Vec<std::path::PathBuf>,
+    // Existing note node ID (if editing a note that's already in the graph)
+    notes_existing_node: Option<NodeId>,
+    // Confirmation dialog for note deletion
+    confirm_note_delete: bool,
+    // Path of note pending deletion
+    note_delete_path: Option<std::path::PathBuf>,
 }
 
 impl GraphApp {
@@ -397,22 +410,12 @@ impl GraphApp {
             query_suggest_index: 0,
             query_suggest_hover_index: None,
             re_cluster_pending: true,
-            _cluster_converge_enabled: false, // deprecated in favor of gravity/repulsion aids
+            _cluster_converge_enabled: false,
             _cluster_converge_threshold: 30,
             _cluster_converge_strength: 3.0,
-            gravity_enabled: false,
-            gravity_strength: 6.0,
-            com_gravity_radius: 150.0,
-            com_gravity_min_neighbors: 2,
-            hub_repulsion_scale: 1.0,
-            lod_enabled: true,
-            lod_label_min_zoom: 0.7,
-            lod_hide_labels_node_threshold: 200,
+            node_label_max_len: 15,
             _edge_labels_enabled: true,
             _edge_labels_only_on_hover: false,
-            edge_label_min_zoom: 0.8,
-            edge_label_count_threshold: 500,
-            edge_label_bg_alpha: 170,
             hover_node: None,
             zoom_hud_until: None,
             app_settings: settings.clone(),
@@ -427,11 +430,19 @@ impl GraphApp {
             api_running: false,
             last_background_time: None,
             first_focused_observed: None,
+            notes_text: String::new(),
+            notes_file_path: String::new(),
+            notes_status: None,
+            notes_label: String::from("Note"),
+            notes_link_targets: HashSet::new(),
+            notes_link_label: String::from("REFERENCES"),
+            prefs_notes_override_str: String::new(),
+            show_note_editor: false,
+            saved_notes_list: Vec::new(),
+            notes_existing_node: None,
+            confirm_note_delete: false,
+            note_delete_path: None,
         };
-        // Apply settings to runtime toggles
-        s.lod_enabled = s.app_settings.lod_enabled;
-        s.lod_label_min_zoom = s.app_settings.lod_label_min_zoom;
-        s.lod_hide_labels_node_threshold = s.app_settings.lod_hide_labels_node_threshold;
         // Initialize API broker and server based on settings
         let rx = api::init_broker();
         s.api_rx = Some(rx);
@@ -445,6 +456,20 @@ impl GraphApp {
             s.api_running = true;
         }
         s
+    }
+
+    fn find_note_node_by_file(&self, file_path: &str) -> Option<NodeId> {
+        if file_path.trim().is_empty() {
+            return None;
+        }
+        for (id, node) in &self.db.nodes {
+            if let Some(f) = node.metadata.get("file") {
+                if f == file_path {
+                    return Some(*id);
+                }
+            }
+        }
+        None
     }
 
     fn ensure_layout(&mut self, rect: Rect) {
@@ -491,10 +516,11 @@ impl GraphApp {
     fn apply_cluster_layout_all(&mut self, rect: Rect) {
         let cluster_positions = self.compute_community_layout(rect);
         let center = rect.center();
-        for id in self.db.nodes.keys().copied() {
+        let node_positions: HashMap<NodeId, Pos2> = self.db.nodes.par_iter().map(|(&id, _)| {
             let p = cluster_positions.get(&id).copied().unwrap_or(center);
-            self.node_positions.insert(id, p);
-        }
+            (id, p)
+        }).collect();
+        self.node_positions.extend(node_positions);
         // Ensure nodes are not overlapping after layout
         self.resolve_overlaps(rect);
         self.re_cluster_pending = false;
@@ -520,45 +546,43 @@ impl GraphApp {
         }
 
         // Precompute label/meta for similarity
-        let mut node_label: Map<NodeId, String> = Map::new();
-        let mut node_meta: Map<NodeId, Map<String, String>> = Map::new();
-        for (id, n) in &self.db.nodes {
-            node_label.insert(*id, n.label.clone());
-            node_meta.insert(*id, n.metadata.clone());
-        }
+        let node_label: Map<NodeId, String> = self.db.nodes.par_iter().map(|(id, n)| (*id, n.label.clone())).collect();
+        let node_meta: Map<NodeId, Map<String, String>> = self.db.nodes.par_iter().map(|(id, n)| (*id, n.metadata.clone())).collect();
 
         // Initialize labels (each node in its own community)
-        let mut community: Map<NodeId, NodeId> = Map::new();
-        for id in self.db.nodes.keys() {
-            community.insert(*id, *id);
+        let mut community: Map<NodeId, NodeId> = self.db.nodes.par_iter().map(|(id, _)| (*id, *id)).collect();
+
+        // Precompute similarity weights for all connected pairs
+        let mut sim_cache: Map<(NodeId, NodeId), f32> = Map::new();
+        for (&u, nbrs) in &neighbors {
+            for &v in nbrs {
+                let pair = if u < v { (u, v) } else { (v, u) };
+                if sim_cache.contains_key(&pair) { continue; }
+                
+                let la = node_label.get(&u).map(|s| s.as_str()).unwrap_or("");
+                let lb = node_label.get(&v).map(|s| s.as_str()).unwrap_or("");
+                let label_bonus = if la == lb && !la.is_empty() { 1.0 } else { 0.0 };
+                let ma = node_meta.get(&u);
+                let mb = node_meta.get(&v);
+                let mut meta_overlap = 0.0f32;
+                if let (Some(ma), Some(mb)) = (ma, mb) {
+                    let mut count = 0usize;
+                    let total = ma.len().max(1);
+                    for (k, va) in ma {
+                        if let Some(vb) = mb.get(k) {
+                            if vb == va { count += 1; }
+                        }
+                    }
+                    meta_overlap = (count as f32) / (total as f32);
+                }
+                let w = 1.0 + 0.75 * label_bonus + 0.5 * meta_overlap;
+                sim_cache.insert(pair, w);
+            }
         }
 
-        // Helper: compute similarity weight between two nodes
-        let mut sim_cache: Map<(NodeId, NodeId), f32> = Map::new();
-        let similarity = |a: NodeId, b: NodeId, sim_cache: &mut Map<(NodeId, NodeId), f32>| -> f32 {
-            if let Some(v) = sim_cache.get(&(a, b)) { return *v; }
-            let la = node_label.get(&a).map(|s| s.as_str()).unwrap_or("");
-            let lb = node_label.get(&b).map(|s| s.as_str()).unwrap_or("");
-            let label_bonus = if la == lb && !la.is_empty() { 1.0 } else { 0.0 };
-            let ma = node_meta.get(&a);
-            let mb = node_meta.get(&b);
-            let mut meta_overlap = 0.0f32;
-            if let (Some(ma), Some(mb)) = (ma, mb) {
-                // simple key/value overlap count
-                let mut count = 0usize;
-                let total = ma.len().max(1);
-                for (k, va) in ma {
-                    if let Some(vb) = mb.get(k) {
-                        if vb == va { count += 1; }
-                    }
-                }
-                // normalize by max meta size to bound in [0,1]
-                meta_overlap = (count as f32) / (total as f32);
-            }
-            // base weight for an edge is 1.0, plus label/meta bonuses when neighbors are similar
-            let w = 1.0 + 0.75 * label_bonus + 0.5 * meta_overlap;
-            sim_cache.insert((a, b), w);
-            w
+        let get_sim = |a: NodeId, b: NodeId, sim_cache: &Map<(NodeId, NodeId), f32>| -> f32 {
+            let pair = if a < b { (a, b) } else { (b, a) };
+            sim_cache.get(&pair).copied().unwrap_or(1.0)
         };
 
         // Label propagation iterations
@@ -568,10 +592,12 @@ impl GraphApp {
             let mut changed = false;
             for &u in &order {
                 let mut scores: Map<NodeId, f32> = Map::new();
-                for &v in neighbors.get(&u).unwrap_or(&Vec::new()) {
-                    let c = *community.get(&v).unwrap_or(&v);
-                    let w = similarity(u, v, &mut sim_cache);
-                    *scores.entry(c).or_insert(0.0) += w;
+                if let Some(nbrs) = neighbors.get(&u) {
+                    for &v in nbrs {
+                        let c = *community.get(&v).unwrap_or(&v);
+                        let w = get_sim(u, v, &sim_cache);
+                        *scores.entry(c).or_insert(0.0) += w;
+                    }
                 }
                 if let Some((&best_comm, _)) = scores
                     .iter()
@@ -600,26 +626,30 @@ impl GraphApp {
         }
 
         let mut comm_density: Map<NodeId, f32> = Map::new();
-        for (c, nodes) in &groups {
+        let densities: Vec<(NodeId, f32)> = groups.par_iter().map(|(&c, nodes)| {
             let s: Set<NodeId> = nodes.iter().copied().collect();
             let mut internal_edges = 0usize;
             let mut possible_edges = nodes.len().saturating_sub(1) * nodes.len() / 2; // undirected approximation
             if possible_edges == 0 { possible_edges = 1; }
             for &u in nodes {
-                for &v in neighbors.get(&u).unwrap_or(&Vec::new()) {
-                    if s.contains(&v) { internal_edges += 1; }
+                if let Some(nbrs) = neighbors.get(&u) {
+                    for &v in nbrs {
+                        if s.contains(&v) { internal_edges += 1; }
+                    }
                 }
             }
             // undirected correction
             let internal_undirected = internal_edges as f32 / 2.0;
-            comm_density.insert(*c, (internal_undirected) / (possible_edges as f32));
-        }
+            (c, (internal_undirected) / (possible_edges as f32))
+        }).collect();
+        for (c, d) in densities { comm_density.insert(c, d); }
 
-        // Place community centroids around a circle; radius based on density
+        // Place community centroids around a circle; radius based on density.
+        // To avoid "large centered grouping", we increase the spread and use a larger minimum radius.
         let center = rect.center();
         let min_dim = rect.width().min(rect.height());
-        let max_radius = 0.46 * min_dim; // near border
-        let min_radius = 0.12 * min_dim; // closer to center for sparse ones
+        let max_radius = 0.48 * min_dim; // closer to border
+        let min_radius = 0.25 * min_dim; // pushed out from center
 
         // Sort communities for stable placement
         let mut comm_ids: Vec<NodeId> = groups.keys().copied().collect();
@@ -629,6 +659,7 @@ impl GraphApp {
         let mut comm_centroids: Map<NodeId, Pos2> = Map::new();
         for (idx, cid) in comm_ids.iter().enumerate() {
             let density = *comm_density.get(cid).unwrap_or(&0.0);
+            // More spread: density maps to radius, but we ensure even very sparse ones are not at center.
             let r = min_radius + (max_radius - min_radius) * density.clamp(0.0, 1.0);
             let angle = (idx as f32) * (std::f32::consts::TAU / comm_count);
             let pos = Pos2::new(center.x + r * angle.cos(), center.y + r * angle.sin());
@@ -640,20 +671,20 @@ impl GraphApp {
         for (cid, nodes) in &groups {
             let centroid = *comm_centroids
                 .get(cid)
-                .unwrap_or(&center); // fallback to center if missing (shouldn't happen)
+                .unwrap_or(&center); 
             let n = nodes.len().max(1) as f32;
-            // local radius scales with community size while also being capped
-            let local_r_base = (min_dim * 0.08).min(30.0 + 6.0 * n.sqrt());
+            // local radius scales with community size; increased slightly for better parsing
+            let local_r_base = (min_dim * 0.12).min(40.0 + 8.0 * n.sqrt());
             let mut local_nodes = nodes.clone();
             local_nodes.sort();
             for (i, node) in local_nodes.iter().enumerate() {
                 let deg = *degree.get(node).unwrap_or(&0) as f32;
-                // Sparse nodes closer to center: lerp toward global center based on low degree
-                let deg_factor = (deg / 6.0).clamp(0.0, 1.0); // >6 neighbors => strong
-                let toward_center = 1.0 - deg_factor; // low degree -> higher pull
+                // Sparse nodes closer to center factor reduced to avoid central clustering.
+                let deg_factor = (deg / 6.0).clamp(0.0, 1.0); 
+                let toward_center = (1.0 - deg_factor) * 0.3; // reduced pull to global center (was 1.0)
 
                 let angle = (i as f32) * (std::f32::consts::TAU / n);
-                let local_r = local_r_base * (0.6 + 0.6 * deg_factor); // higher degree slightly farther within cluster
+                let local_r = local_r_base * (0.7 + 0.5 * deg_factor); 
                 let p_cluster = Pos2::new(centroid.x + local_r * angle.cos(), centroid.y + local_r * angle.sin());
                 let p = Pos2::new(
                     p_cluster.x * (1.0 - toward_center) + center.x * toward_center,
@@ -761,47 +792,45 @@ impl GraphApp {
             // Collect keys to avoid cloning the whole grid for iteration
             let keys: Vec<(i32, i32)> = grid.keys().cloned().collect();
 
-            for (ix, iy) in keys {
-                if let Some(ids) = grid.get(&(ix, iy)) {
-                    for (dx, dy) in offsets {
-                        let key = (ix + dx, iy + dy);
-                        if let Some(neigh_ids) = grid.get(&key) {
-                            for &a in ids {
-                                for &b in neigh_ids {
-                                    if a >= b { continue; } // avoid double-processing and self
-                                    
-                                    // Use a single borrow check if possible
-                                    let (pa, pb) = match (self.node_positions.get(&a), self.node_positions.get(&b)) {
-                                        (Some(pa), Some(pb)) => (*pa, *pb),
-                                        _ => continue,
-                                    };
-                                    
-                                    let dx = pb.x - pa.x;
-                                    let dy = pb.y - pa.y;
-                                    let d2 = dx*dx + dy*dy;
-                                    if d2 < min_dist_sq && d2 > 1e-6 {
-                                        let d = d2.sqrt();
-                                        let overlap = (min_dist - d) * 0.5; // split push
-                                        let nx = dx / d;
-                                        let ny = dy / d;
-                                        if let Some(p) = self.node_positions.get_mut(&a) {
-                                            p.x -= nx * overlap;
-                                            p.y -= ny * overlap;
-                                        }
-                                        if let Some(p) = self.node_positions.get_mut(&b) {
-                                            p.x += nx * overlap;
-                                            p.y += ny * overlap;
-                                        }
-                                    } else if d2 <= 1e-6 {
-                                        // Same position: nudge apart deterministically
-                                        if let Some(pa_mut) = self.node_positions.get_mut(&a) {
-                                            pa_mut.x -= 0.5 * min_dist;
-                                            pa_mut.y -= 0.3 * min_dist;
-                                        }
-                                        if let Some(pb_mut) = self.node_positions.get_mut(&b) {
-                                            pb_mut.x += 0.5 * min_dist;
-                                            pb_mut.y += 0.3 * min_dist;
-                                        }
+        for (ix, iy) in keys {
+            if let Some(ids) = grid.get(&(ix, iy)) {
+                for (dx, dy) in offsets {
+                    let key = (ix + dx, iy + dy);
+                    if let Some(neigh_ids) = grid.get(&key) {
+                        for &a in ids {
+                            for &b in neigh_ids {
+                                if a >= b { continue; } // avoid double-processing and self
+                                
+                                let (pa, pb) = match (self.node_positions.get(&a), self.node_positions.get(&b)) {
+                                    (Some(pa), Some(pb)) => (*pa, *pb),
+                                    _ => continue,
+                                };
+                                
+                                let dx = pb.x - pa.x;
+                                let dy = pb.y - pa.y;
+                                let d2 = dx*dx + dy*dy;
+                                if d2 < min_dist_sq && d2 > 1e-6 {
+                                    let d = d2.sqrt();
+                                    let overlap = (min_dist - d) * 0.5; // split push
+                                    let nx = dx / d;
+                                    let ny = dy / d;
+                                    if let Some(p) = self.node_positions.get_mut(&a) {
+                                        p.x -= nx * overlap;
+                                        p.y -= ny * overlap;
+                                    }
+                                    if let Some(p) = self.node_positions.get_mut(&b) {
+                                        p.x += nx * overlap;
+                                        p.y += ny * overlap;
+                                    }
+                                } else if d2 <= 1e-6 {
+                                    // Same position: nudge apart deterministically
+                                    if let Some(pa_mut) = self.node_positions.get_mut(&a) {
+                                        pa_mut.x -= 0.5 * min_dist;
+                                        pa_mut.y -= 0.3 * min_dist;
+                                    }
+                                    if let Some(pb_mut) = self.node_positions.get_mut(&b) {
+                                        pb_mut.x += 0.5 * min_dist;
+                                        pb_mut.y += 0.3 * min_dist;
                                     }
                                 }
                             }
@@ -809,18 +838,25 @@ impl GraphApp {
                     }
                 }
             }
+        }
 
             // Clamp into rect to avoid drifting out of view
-            for p in self.node_positions.values_mut() {
+            self.node_positions.par_iter_mut().for_each(|(_, p)| {
                 p.x = p.x.clamp(rect.left() + 8.0, rect.right() - 8.0);
                 p.y = p.y.clamp(rect.top() + 8.0, rect.bottom() - 8.0);
-            }
+            });
         }
     }
 
     pub fn from_state(state: AppStateFile) -> Self {
         let (db, positions, pan, zoom) = state.to_runtime();
+
         let settings = AppSettings::load().unwrap_or_default();
+        // If embedding tables are empty, rebuild embeddings for all nodes and persist them
+        if persist::is_embeddings_empty() && !db.nodes.is_empty() {
+            // Use reembed_with_model which properly persists to SQLite
+            let _ = query_interface::reembed_with_model(&db, settings.embedding_model);
+        }
         let mut s = Self {
             db,
             node_positions: positions,
@@ -891,19 +927,9 @@ impl GraphApp {
             _cluster_converge_enabled: false,
             _cluster_converge_threshold: 30,
             _cluster_converge_strength: 3.0,
-            gravity_enabled: false,
-            gravity_strength: 6.0,
-            com_gravity_radius: 150.0,
-            com_gravity_min_neighbors: 2,
-            hub_repulsion_scale: 1.0,
-            lod_enabled: true,
-            lod_label_min_zoom: 0.7,
-            lod_hide_labels_node_threshold: 200,
+            node_label_max_len: 15,
             _edge_labels_enabled: true,
             _edge_labels_only_on_hover: false,
-            edge_label_min_zoom: 0.8,
-            edge_label_count_threshold: 500,
-            edge_label_bg_alpha: 170,
             hover_node: None,
             zoom_hud_until: None,
             app_settings: settings.clone(),
@@ -918,11 +944,19 @@ impl GraphApp {
             api_running: false,
             last_background_time: None,
             first_focused_observed: None,
+            notes_text: String::new(),
+            notes_file_path: String::new(),
+            notes_status: None,
+            notes_label: String::from("Note"),
+            notes_link_targets: HashSet::new(),
+            notes_link_label: String::from("REFERENCES"),
+            prefs_notes_override_str: String::new(),
+            show_note_editor: false,
+            saved_notes_list: Vec::new(),
+            notes_existing_node: None,
+            confirm_note_delete: false,
+            note_delete_path: None,
         };
-        // Apply settings to runtime toggles
-        s.lod_enabled = s.app_settings.lod_enabled;
-        s.lod_label_min_zoom = s.app_settings.lod_label_min_zoom;
-        s.lod_hide_labels_node_threshold = s.app_settings.lod_hide_labels_node_threshold;
         // Initialize API broker and server based on settings
         let rx = api::init_broker();
         s.api_rx = Some(rx);
@@ -944,7 +978,12 @@ impl GraphApp {
     }
 
     fn save_now_with(&mut self, style: NoticeStyle) {
-        let state = AppStateFile::from_runtime(&self.db, &self.node_positions, self.pan, self.zoom);
+        let state = AppStateFile::from_runtime(
+            &self.db,
+            &self.node_positions,
+            self.pan,
+            self.zoom,
+        );
         match persist::save_active(&state) {
             Ok(path) => {
                 self.dirty = false;
@@ -963,7 +1002,12 @@ impl GraphApp {
     fn save_now(&mut self) { self.save_now_with(NoticeStyle::Prominent); }
 
     fn save_versioned_now(&mut self) {
-        let state = AppStateFile::from_runtime(&self.db, &self.node_positions, self.pan, self.zoom);
+        let state = AppStateFile::from_runtime(
+            &self.db,
+            &self.node_positions,
+            self.pan,
+            self.zoom,
+        );
         match persist::save_versioned(&state) {
             Ok(path) => {
                 self.last_save = Instant::now();
@@ -1081,6 +1125,10 @@ impl GraphApp {
             Some(p) => p.display().to_string(),
             None => String::new(),
         };
+        self.prefs_notes_override_str = match &self.prefs_edit.notes_dir_override {
+            Some(p) => p.display().to_string(),
+            None => String::new(),
+        };
         self.prefs_tab = PrefsTab::App;
         self.prefs_status = None;
         self.show_prefs_window = true;
@@ -1150,7 +1198,7 @@ impl eframe::App for GraphApp {
                 std::thread::spawn(move || {
                     for i in 1..=5 {
                         std::thread::sleep(std::time::Duration::from_millis(500));
-                        
+
                         // If the user has hidden the window again during this loop, stop immediately
                         if !crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
@@ -1159,7 +1207,7 @@ impl eframe::App for GraphApp {
 
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                        
+
                         // Use Win32 API to force foreground on Windows
                         #[cfg(target_os = "windows")]
                         unsafe {
@@ -1191,7 +1239,7 @@ impl eframe::App for GraphApp {
                 // Minimized(true) is often better than Visible(false).
                 // However, the user said "The app icon on the taskbar also does not return as it should",
                 // implying it DOES leave the taskbar (which is what we want for "background mode").
-                // If we use Visible(false), it leaves the taskbar. 
+                // If we use Visible(false), it leaves the taskbar.
                 // To make it come back, we MUST use Visible(true).
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
@@ -1209,7 +1257,7 @@ impl eframe::App for GraphApp {
                         None => query_interface::execute_and_log(&mut self.db, &req.query),
                     };
                     let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
-                    
+
                     // If we mutated the DB, we might want to save eventually.
                     // But we don't need to repaint the UI.
                 }
@@ -1243,9 +1291,15 @@ impl eframe::App for GraphApp {
             );
             // Best effort respond; ignore send errors if client disconnected
             let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
-            
+
             count += 1;
             if count >= 5 { break; } // Process at most 5 requests per frame
+        }
+
+        // Schedule periodic repaint to process API requests even when GUI is idle
+        // This ensures glsh/gRPC queries don't hang waiting for user interaction
+        if self.api_running {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
         // Native menu command handling removed; in-window menus cover these actions
@@ -1264,6 +1318,10 @@ impl eframe::App for GraphApp {
                         if ui.selectable_label(app_sel, "App Settings").clicked() { self.prefs_tab = PrefsTab::App; }
                         let api_sel = self.prefs_tab == PrefsTab::Api;
                         if ui.selectable_label(api_sel, "API Settings").clicked() { self.prefs_tab = PrefsTab::Api; }
+                        let llm_sel = self.prefs_tab == PrefsTab::Llm;
+                        if ui.selectable_label(llm_sel, "LLM Settings").clicked() { self.prefs_tab = PrefsTab::Llm; }
+                        let emb_sel = self.prefs_tab == PrefsTab::Embeddings;
+                        if ui.selectable_label(emb_sel, "Embeddings").clicked() { self.prefs_tab = PrefsTab::Embeddings; }
                     });
                     ui.separator();
 
@@ -1309,11 +1367,31 @@ impl eframe::App for GraphApp {
                             ui.label("Effective export default directory:");
                             ui.monospace(eff_export.display().to_string());
 
+                            ui.add_space(8.0);
+                            // Notes directory override
+                            ui.label("Notes directory (leave empty for ~/Documents/Graph-Loom/notes):");
+                            let _ = ui.text_edit_singleline(&mut self.prefs_notes_override_str);
+                            if ui.button("Clear to default").clicked() {
+                                self.prefs_notes_override_str.clear();
+                            }
+                            let eff_notes = if self.prefs_notes_override_str.trim().is_empty() {
+                                AppSettings::notes_default_dir()
+                            } else {
+                                std::path::PathBuf::from(self.prefs_notes_override_str.trim())
+                            };
+                            ui.label("Effective notes directory:");
+                            ui.monospace(eff_notes.display().to_string());
+
                             ui.separator();
-                            ui.heading("Rendering / LOD");
-                            ui.checkbox(&mut self.prefs_edit.lod_enabled, "Enable level-of-detail (LOD)");
-                            ui.add(egui::Slider::new(&mut self.prefs_edit.lod_label_min_zoom, 0.1..=3.0).text("Label min zoom"));
-                            ui.add(egui::Slider::new(&mut self.prefs_edit.lod_hide_labels_node_threshold, 0..=5000).text("Hide labels above N nodes"));
+                            ui.heading("Physics / Layout");
+                            ui.horizontal(|ui| {
+                                ui.label("Node movement timeout (seconds):");
+                                let mut timeout = self.prefs_edit.physics_timeout_secs as i32;
+                                if ui.add(egui::DragValue::new(&mut timeout).range(0..=300)).changed() {
+                                    self.prefs_edit.physics_timeout_secs = timeout as u64;
+                                }
+                            });
+                            ui.small("0 = indefinite (nodes move until settled). Higher values stop physics after N seconds.");
 
                             ui.separator();
                             ui.heading("Background Mode");
@@ -1370,6 +1448,156 @@ impl eframe::App for GraphApp {
                             };
                             ui.small(format!("Effective API log dir: {}", eff_api_log.display()));
                         }
+                        PrefsTab::Llm => {
+                            ui.heading("LLM Integration");
+                            ui.label("Configure LLM provider for semantic features (entity extraction, natural language queries).");
+                            ui.separator();
+
+                            ui.horizontal(|ui| {
+                                ui.label("Provider:");
+                                egui::ComboBox::from_id_salt("llm_provider")
+                                    .selected_text(self.prefs_edit.llm_provider.as_str())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.prefs_edit.llm_provider, LlmProvider::None, "None");
+                                        ui.selectable_value(&mut self.prefs_edit.llm_provider, LlmProvider::OpenAI, "OpenAI");
+                                        ui.selectable_value(&mut self.prefs_edit.llm_provider, LlmProvider::Anthropic, "Anthropic");
+                                        ui.selectable_value(&mut self.prefs_edit.llm_provider, LlmProvider::Ollama, "Ollama (Local)");
+                                    });
+                            });
+
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label("API Key:");
+                                let key_str = self.prefs_edit.llm_api_key.clone().unwrap_or_default();
+                                let mut key_edit = key_str;
+                                if ui.add(egui::TextEdit::singleline(&mut key_edit).password(true).hint_text("Enter API key")).changed() {
+                                    self.prefs_edit.llm_api_key = if key_edit.is_empty() { None } else { Some(key_edit) };
+                                }
+                            });
+                            ui.small("Required for OpenAI and Anthropic. Not needed for local Ollama.");
+
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Model:");
+                                ui.text_edit_singleline(&mut self.prefs_edit.llm_model);
+                            });
+                            ui.small("Examples: gpt-4o-mini, claude-3-haiku-20240307, llama3.2");
+
+                            ui.add_space(8.0);
+                            let endpoint_str = self.prefs_edit.llm_endpoint.clone().unwrap_or_default();
+                            let mut endpoint_edit = endpoint_str;
+                            ui.horizontal(|ui| {
+                                ui.label("Custom Endpoint:");
+                                if ui.text_edit_singleline(&mut endpoint_edit).changed() {
+                                    self.prefs_edit.llm_endpoint = if endpoint_edit.is_empty() { None } else { Some(endpoint_edit) };
+                                }
+                            });
+                            ui.small("Optional. For Ollama, default is http://localhost:11434");
+
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.heading("Usage");
+                            ui.label("Once configured, use these query commands:");
+                            ui.monospace("CALL semantic.extract(\"Your text here\")");
+                            ui.small("  → Extracts entities from text");
+                            ui.monospace("CALL db.schema()");
+                            ui.small("  → Shows graph schema with query suggestions");
+                        }
+                        PrefsTab::Embeddings => {
+                            // Query Tips Section
+                            ui.collapsing("💡 Query Tips", |ui| {
+                                ui.monospace("CALL embedding.similar(\"search text\", k)");
+                                ui.small("  → Find k most similar nodes");
+                                ui.monospace("CALL embedding.neighbors(nodeId, k)");
+                                ui.small("  → Find k nearest neighbors to a node");
+                                ui.monospace("CALL embedding.threshold(\"text\", 0.5)");
+                                ui.small("  → Find nodes above similarity threshold");
+                            });
+                            ui.add_space(8.0);
+
+                            // Model Selection
+                            ui.horizontal(|ui| {
+                                ui.label("Model:");
+                                egui::ComboBox::from_id_salt("embedding_model_select")
+                                    .selected_text(match self.prefs_edit.embedding_model {
+                                        crate::persistence::settings::EmbeddingModel::TfIdf => "TF-IDF (Fast)",
+                                        crate::persistence::settings::EmbeddingModel::Word2Vec => "Word2Vec (Semantic)",
+                                        crate::persistence::settings::EmbeddingModel::Onnx => "all-MiniLM-L6-v2 (Best)",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.prefs_edit.embedding_model,
+                                            crate::persistence::settings::EmbeddingModel::Onnx,
+                                            "ONNX (Best Quality)"
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.prefs_edit.embedding_model,
+                                            crate::persistence::settings::EmbeddingModel::TfIdf,
+                                            "TF-IDF (Fast)"
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.prefs_edit.embedding_model,
+                                            crate::persistence::settings::EmbeddingModel::Word2Vec,
+                                            "Word2Vec (Semantic)"
+                                        );
+                                    });
+                            });
+                            ui.add_space(8.0);
+
+                            // Embedding Statistics
+                            if let crate::persistence::settings::StorageBackend::Sqlite = self.app_settings.storage_backend {
+                                if let Some(storage) = persist::get_sqlite_storage() {
+                                    if let Ok(stats) = storage.get_stats() {
+                                        ui.label(format!(
+                                            "📊 TF-IDF: {} | Word2Vec: {} | ONNX: {} | Nodes: {}",
+                                            stats.tfidf_embeddings, stats.word2vec_embeddings, stats.onnx_embeddings, stats.node_count
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.add_space(8.0);
+
+                            // Actions for selected model
+                            ui.horizontal(|ui| {
+                                if ui.button("🗑 Clear").on_hover_text("Clear embeddings for selected model").clicked() {
+                                    let model_type = match self.prefs_edit.embedding_model {
+                                        crate::persistence::settings::EmbeddingModel::TfIdf => "tfidf",
+                                        crate::persistence::settings::EmbeddingModel::Word2Vec => "word2vec",
+                                        crate::persistence::settings::EmbeddingModel::Onnx => "onnx",
+                                    };
+                                    let model_name = match self.prefs_edit.embedding_model {
+                                        crate::persistence::settings::EmbeddingModel::TfIdf => "TF-IDF",
+                                        crate::persistence::settings::EmbeddingModel::Word2Vec => "Word2Vec",
+                                        crate::persistence::settings::EmbeddingModel::Onnx => "ONNX",
+                                    };
+                                    if let Some(storage) = persist::get_sqlite_storage() {
+                                        match storage.clear_model_embeddings(model_type) {
+                                            Ok(_) => self.prefs_status = Some(format!("{} embeddings cleared", model_name)),
+                                            Err(e) => self.prefs_status = Some(format!("Error: {}", e)),
+                                        }
+                                    }
+                                }
+                                if ui.button("🔄 Regenerate").on_hover_text("Regenerate embeddings for selected model").clicked() {
+                                    match query_interface::reembed_with_model(&self.db, self.prefs_edit.embedding_model) {
+                                        Ok(msg) => {
+                                            self.mark_dirty();
+                                            let _ = self.prefs_edit.save();
+                                            self.app_settings = self.prefs_edit.clone();
+                                            self.prefs_status = Some(msg);
+                                        }
+                                        Err(e) => self.prefs_status = Some(format!("Error: {}", e)),
+                                    }
+                                }
+                                if ui.button("🧹 Optimize DB").on_hover_text("Run VACUUM + ANALYZE").clicked() {
+                                    if let Some(storage) = persist::get_sqlite_storage() {
+                                        match storage.optimize() {
+                                            Ok(_) => self.prefs_status = Some("Database optimized".to_string()),
+                                            Err(e) => self.prefs_status = Some(format!("Error: {}", e)),
+                                        }
+                                    }
+                                }
+                            });
+                        }
                     }
 
                     if let Some(msg) = &self.prefs_status {
@@ -1398,22 +1626,27 @@ impl eframe::App for GraphApp {
                             } else {
                                 Some(std::path::PathBuf::from(self.prefs_api_log_override_str.trim()))
                             };
+                            // Apply notes path
+                            self.prefs_edit.notes_dir_override = if self.prefs_notes_override_str.trim().is_empty() {
+                                None
+                            } else {
+                                Some(std::path::PathBuf::from(self.prefs_notes_override_str.trim()))
+                            };
                             // Persist
                             match self.prefs_edit.save() {
                                 Ok(()) => {
+                                    // Save embedding model to SQLite for CALL embedding.* functions
+                                    let _ = persist::save_current_embedding_model(self.prefs_edit.embedding_model);
+                                    
                                     // Determine if API server config changed
                                     let old_api = (self.app_settings.api_enabled.clone(), self.app_settings.api_bind_addr.clone(), self.app_settings.api_port, self.app_settings.api_key.clone());
                                     let old_grpc = (self.app_settings.grpc_enabled.clone(), self.app_settings.grpc_port, self.app_settings.api_bind_addr.clone(), self.app_settings.api_key.clone());
                                     // Detect export dir change to refresh default export paths in views
                                     let old_export_dir = self.app_settings.export_dir();
                                     self.app_settings = self.prefs_edit.clone();
-                                    // Apply to runtime
-                                    self.lod_enabled = self.app_settings.lod_enabled;
-                                    self.lod_label_min_zoom = self.app_settings.lod_label_min_zoom;
-                                    self.lod_hide_labels_node_threshold = self.app_settings.lod_hide_labels_node_threshold;
                                     let new_api = (self.app_settings.api_enabled.clone(), self.app_settings.api_bind_addr.clone(), self.app_settings.api_port, self.app_settings.api_key.clone());
                                     let new_grpc = (self.app_settings.grpc_enabled.clone(), self.app_settings.grpc_port, self.app_settings.api_bind_addr.clone(), self.app_settings.api_key.clone());
-                                    
+
                                     if old_api != new_api {
                                         // Restart server
                                         api::server::stop_server();
@@ -1430,6 +1663,9 @@ impl eframe::App for GraphApp {
                                     }
 
                                     self.api_running = self.app_settings.api_enabled || self.app_settings.grpc_enabled;
+
+                                    // Toast the success message
+                                    self.prefs_status = Some("Settings saved successfully".to_string());
 
                                     let new_export_dir = self.app_settings.export_dir();
                                     if old_export_dir != new_export_dir {
@@ -1462,10 +1698,6 @@ impl eframe::App for GraphApp {
                                             self.query_export_path = base.display().to_string();
                                         }
                                     }
-                                    self.last_save_info = Some("Preferences saved".into());
-                                    self.last_info_time = Some(Instant::now());
-                                    self.last_info_style = NoticeStyle::Prominent;
-                                    self.show_prefs_window = false;
                                 }
                                 Err(e) => {
                                     self.prefs_status = Some(format!("Failed to save preferences: {}", e));
@@ -1677,12 +1909,14 @@ impl eframe::App for GraphApp {
             let panel_id = match self.sidebar_mode {
                 SidebarMode::Tooling => "tooling_sidebar",
                 SidebarMode::Query => "query_sidebar",
+                SidebarMode::Notes => "notes_sidebar",
             };
             egui::SidePanel::left(panel_id)
                 .resizable(true)
                 .default_width(match self.sidebar_mode {
                     SidebarMode::Tooling => 260.0,
                     SidebarMode::Query => 300.0,
+                    SidebarMode::Notes => 320.0,
                 })
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -1696,6 +1930,28 @@ impl eframe::App for GraphApp {
                             self.deselect_all();
                             self.multi_select_active = false;
                             self.sidebar_mode = SidebarMode::Query;
+                        }
+                        let notes_sel = self.sidebar_mode == SidebarMode::Notes;
+                        if ui.selectable_label(notes_sel, "Notes").clicked() {
+                            self.deselect_all();
+                            self.multi_select_active = false;
+                            self.sidebar_mode = SidebarMode::Notes;
+                            // Refresh notes list on tab open
+                            let dir = self.app_settings.notes_dir();
+                            self.saved_notes_list.clear();
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                for entry in entries.flatten() {
+                                    let p = entry.path();
+                                    if p.is_file() {
+                                        if let Some(ext) = p.extension() {
+                                            if ext == "md" || ext == "txt" {
+                                                self.saved_notes_list.push(p);
+                                            }
+                                        }
+                                    }
+                                }
+                                self.saved_notes_list.sort();
+                            }
                         }
                     });
                     ui.separator();
@@ -1719,64 +1975,11 @@ impl eframe::App for GraphApp {
                         ui.small("Clusters by relationships, labels, and metadata. Dense clusters toward border; sparse toward center.");
 
                         ui.separator();
-                        ui.label("Layout aids for large graphs");
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.gravity_enabled, "Enable gravity to center");
-                            ui.add(egui::Slider::new(&mut self.gravity_strength, 0.5..=20.0)
-                                .logarithmic(true)
-                                .clamping(egui::SliderClamping::Always)
-                                .text("gravity"));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Local COM radius");
-                            ui.add(egui::Slider::new(&mut self.com_gravity_radius, 60.0..=800.0)
-                                .logarithmic(true)
-                                .clamping(egui::SliderClamping::Always)
-                                .suffix(" px"))
-                                .on_hover_text("Within this radius, nodes are attracted to the center of mass of nearby nodes instead of the window center");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Min neighbors for COM");
-                            let mut min_n = self.com_gravity_min_neighbors as i32;
-                            if ui.add(egui::Slider::new(&mut min_n, 1..=10).clamping(egui::SliderClamping::Always)).changed() {
-                                self.com_gravity_min_neighbors = min_n as usize;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Hub repulsion scale");
-                            ui.add(egui::Slider::new(&mut self.hub_repulsion_scale, 0.0..=3.0)
-                                .clamping(egui::SliderClamping::Always)
-                                .text("hubs spread"));
-                        });
-                        ui.separator();
-                        ui.label("Level of detail (LOD)");
-                        ui.checkbox(&mut self.lod_enabled, "Enable LOD").on_hover_text("Hide most labels when zoomed out or when the graph is very large; always show for hovered/selected/query-matched nodes");
-                        ui.horizontal(|ui| {
-                            ui.label("Hide labels when nodes ≥");
-                            ui.add(egui::DragValue::new(&mut self.lod_hide_labels_node_threshold).range(50..=2000));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Min zoom for labels");
-                            ui.add(egui::Slider::new(&mut self.lod_label_min_zoom, 0.3..=1.5).clamping(egui::SliderClamping::Always));
+                            ui.label("Max label length");
+                            ui.add(egui::DragValue::new(&mut self.node_label_max_len).range(5..=100));
                         });
 
-                        ui.separator();
-                        ui.label("Relationship label readability");
-                        ui.horizontal(|ui| {
-                            ui.label("Min zoom for edge labels");
-                            ui.add(egui::Slider::new(&mut self.edge_label_min_zoom, 0.3..=2.0).clamping(egui::SliderClamping::Always));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Hide when edges ≥");
-                            ui.add(egui::DragValue::new(&mut self.edge_label_count_threshold).range(100..=5000));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Label background opacity");
-                            let mut alpha_f: f32 = self.edge_label_bg_alpha as f32;
-                            if ui.add(egui::Slider::new(&mut alpha_f, 30.0..=255.0)).changed() {
-                                self.edge_label_bg_alpha = alpha_f as u8;
-                            }
-                        });
                         });
 
                     egui::CollapsingHeader::new("Create Node")
@@ -1808,7 +2011,7 @@ impl eframe::App for GraphApp {
                                     ui.horizontal(|ui| {
                                         ui.label("Target:");
                                         let tgt_text = self.create_node_rel_target
-                                            .and_then(|id| self.db.nodes.get(&id).map(|_| format_short_node(&self.db, id)))
+                                            .and_then(|id| self.db.nodes.get(&id).map(|_| format_short_node(&self.db, id, self.node_label_max_len)))
                                             .unwrap_or_else(|| "<none>".into());
                                         ui.monospace(tgt_text);
                                     });
@@ -1888,7 +2091,7 @@ impl eframe::App for GraphApp {
                                 ui.label("From:");
                                 let key = self.create_rel_display_key.trim();
                                 let from_text = self.create_rel_from.map(|id| {
-                                    let base = format_short_node(&self.db, id);
+                                    let base = format_short_node(&self.db, id, self.node_label_max_len);
                                     if !key.is_empty() {
                                         if let Some(n) = self.db.nodes.get(&id) {
                                             if let Some(val) = n.metadata.get(key) {
@@ -1912,7 +2115,7 @@ impl eframe::App for GraphApp {
                                 ui.label("To:");
                                 let key = self.create_rel_display_key.trim();
                                 let to_text = self.create_rel_to.map(|id| {
-                                    let base = format_short_node(&self.db, id);
+                                    let base = format_short_node(&self.db, id, self.node_label_max_len);
                                     if !key.is_empty() {
                                         if let Some(n) = self.db.nodes.get(&id) {
                                             if let Some(val) = n.metadata.get(key) {
@@ -2149,9 +2352,20 @@ impl eframe::App for GraphApp {
                                 // Build suggestion universe (cached)
                                 let mut pool: Vec<String> = Vec::new();
                                 const KEYWORDS: &[&str] = &[
+                                    // OpenCypher keywords
                                     "MATCH","OPTIONAL","OPTIONAL MATCH","WHERE","RETURN","ORDER BY","SKIP","LIMIT",
                                     "CREATE","MERGE","SET","REMOVE","DELETE","DETACH DELETE",
-                                    "DISTINCT","ASC","DESC",
+                                    "DISTINCT","ASC","DESC","WITH","UNWIND","AND","OR","NOT","IN","IS NULL","IS NOT NULL","CONTAINS","STARTS WITH","ENDS WITH",
+                                    // CALL procedures - Algorithms
+                                    "CALL","CALL algo.pageRank()","CALL algo.betweenness()","CALL algo.shortestPath(","CALL algo.astar(","CALL algo.allPaths(",
+                                    // CALL procedures - Database
+                                    "CALL db.search(","CALL db.schema()",
+                                    // CALL procedures - Temporal
+                                    "CALL temporal.timeline()","CALL temporal.range()","CALL temporal.nodesInRange(","CALL temporal.atTime(",
+                                    // CALL procedures - Semantic
+                                    "CALL semantic.extract(",
+                                    // CALL procedures - Embeddings
+                                    "CALL embedding.similar(","CALL embedding.neighbors(","CALL embedding.threshold(",
                                 ];
                                 pool.extend(KEYWORDS.iter().map(|s| s.to_string()));
                                 
@@ -2468,9 +2682,146 @@ impl eframe::App for GraphApp {
                         }); // close Query ScrollArea
                     }); // close Query scope
                 } // close SidebarMode::Query
+                SidebarMode::Notes => {
+                    ui.heading("Notes");
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        // Action buttons
+                        ui.horizontal(|ui| {
+                            if ui.button("📝 New Note").clicked() {
+                                self.notes_text.clear();
+                                self.notes_file_path.clear();
+                                self.notes_label = String::from("Note");
+                                self.notes_link_targets.clear();
+                                self.notes_existing_node = None;
+                                self.notes_status = None;
+                                self.show_note_editor = true;
+                            }
+                            if ui.button("📂 Open Editor").clicked() {
+                                self.show_note_editor = true;
+                            }
+                        });
+                        
+                        ui.add_space(4.0);
+                        ui.small(format!("Notes folder: {}", self.app_settings.notes_dir().display()));
+                        
+                        // Refresh saved notes list button
+                        if ui.button("🔄 Refresh List").clicked() {
+                            let dir = self.app_settings.notes_dir();
+                            self.saved_notes_list.clear();
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                for entry in entries.flatten() {
+                                    let path = entry.path();
+                                    if path.is_file() {
+                                        if let Some(ext) = path.extension() {
+                                            if ext == "md" || ext == "txt" {
+                                                self.saved_notes_list.push(path);
+                                            }
+                                        }
+                                    }
+                                }
+                                self.saved_notes_list.sort();
+                            }
+                        }
+                        
+                        ui.separator();
+                        ui.label("Saved Notes:");
+                        
+                        if self.saved_notes_list.is_empty() {
+                            ui.small("No notes found. Click 'Refresh List' to scan.");
+                        } else {
+                            for path in self.saved_notes_list.clone() {
+                                let filename = path.file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                ui.horizontal(|ui| {
+                                    if ui.button(&filename).clicked() {
+                                        // Load and open in editor
+                                        if let Ok(content) = std::fs::read_to_string(&path) {
+                                            self.notes_text = content;
+                                            let path_str = path.display().to_string();
+                                            self.notes_file_path = path_str.clone();
+                                            self.notes_status = Some(format!("Loaded: {}", filename));
+                                            // Check if this note already exists as a node
+                                            self.notes_existing_node = self.find_note_node_by_file(&path_str);
+                                            self.show_note_editor = true;
+                                        }
+                                    }
+                                    // Delete button for each note in the list
+                                    if ui.small_button("🗑").on_hover_text("Delete note").clicked() {
+                                        self.note_delete_path = Some(path.clone());
+                                        self.confirm_note_delete = true;
+                                    }
+                                });
+                            }
+                        }
+                        
+                        if let Some(status) = &self.notes_status {
+                            ui.separator();
+                            ui.small(status.clone());
+                        }
+                    });
+                } // close SidebarMode::Notes
             } // close match self.sidebar_mode
         }); // close SidePanel::show
     } // close if self.sidebar_open
+
+        // Confirmation modal for note delete
+        if self.confirm_note_delete {
+            egui::Window::new("Confirm Delete Note")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    let filename = self.note_delete_path.as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "this note".to_string());
+                    ui.label(format!("Delete '{}'?", filename));
+                    ui.label("This will delete the file and remove any associated graph node.");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button(egui::RichText::new("Delete").color(Color32::RED)).clicked() {
+                            if let Some(path) = self.note_delete_path.take() {
+                                let path_str = path.display().to_string();
+                                // Delete the associated graph node if it exists
+                                if let Some(node_id) = self.find_note_node_by_file(&path_str) {
+                                    if self.db.remove_node(node_id) {
+                                        self.node_positions.remove(&node_id);
+                                        self.open_node_windows.remove(&node_id);
+                                        self.mark_dirty();
+                                    }
+                                    // Prune relationship windows
+                                    self.open_rel_windows.retain(|rid| self.db.relationships.contains_key(rid));
+                                }
+                                // Delete the file
+                                match std::fs::remove_file(&path) {
+                                    Ok(_) => {
+                                        self.notes_status = Some(format!("✓ Deleted: {}", filename));
+                                        // Clear editor and close window if this was the open note
+                                        if self.notes_file_path == path_str {
+                                            self.notes_text.clear();
+                                            self.notes_file_path.clear();
+                                            self.notes_existing_node = None;
+                                            self.show_note_editor = false;
+                                        }
+                                        // Refresh notes list
+                                        self.saved_notes_list.retain(|p| p != &path);
+                                    }
+                                    Err(e) => {
+                                        self.notes_status = Some(format!("Delete failed: {}", e));
+                                    }
+                                }
+                            }
+                            self.confirm_note_delete = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.note_delete_path = None;
+                            self.confirm_note_delete = false;
+                        }
+                    });
+                });
+        }
 
         // Confirmation modal for mass delete
         if self.confirm_mass_delete {
@@ -2508,6 +2859,332 @@ impl eframe::App for GraphApp {
                         }
                     });
                 });
+        }
+
+        // Pop-out Note Editor Window
+        if self.show_note_editor {
+            let mut open = true;
+            egui::Window::new("📝 Note Editor")
+                .id(egui::Id::new("note_editor_window"))
+                .open(&mut open)
+                .resizable(true)
+                .default_width(500.0)
+                .default_height(400.0)
+                .show(ctx, |ui| {
+                    // Top toolbar
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 Save").clicked() {
+                            // Determine save path - similar to other note-taking apps:
+                            // - Empty path: auto-generate timestamped filename in default dir
+                            // - Just a filename: save to default notes directory
+                            // - Full path: use as-is
+                            let trimmed_path = self.notes_file_path.trim();
+                            let dir = self.app_settings.notes_dir();
+                            
+                            let path: std::path::PathBuf = if trimmed_path.is_empty() {
+                                // Auto-generate filename with timestamp in default directory
+                                match std::fs::create_dir_all(&dir) {
+                                    Err(e) => {
+                                        self.notes_status = Some(format!("Failed to create notes dir '{}': {}", dir.display(), e));
+                                        std::path::PathBuf::new()
+                                    }
+                                    Ok(()) => {
+                                        let now = time::OffsetDateTime::now_utc();
+                                        let fmt = time::macros::format_description!("[year][month][day]_[hour][minute][second]");
+                                        let stamp = now.format(&fmt).unwrap_or_else(|_| "note".into());
+                                        let filename = format!("{}.md", stamp);
+                                        let full_path = dir.join(&filename);
+                                        self.notes_file_path = full_path.display().to_string();
+                                        full_path
+                                    }
+                                }
+                            } else {
+                                let mut p = std::path::PathBuf::from(trimmed_path);
+                                // Default to .md extension if no extension specified
+                                if p.extension().is_none() {
+                                    let mut new_name = p.file_name().unwrap_or_default().to_os_string();
+                                    new_name.push(".md");
+                                    p.set_file_name(new_name);
+                                }
+                                // Validate that the path has a filename component
+                                if p.file_name().is_none() || p.file_name().map(|f| f.is_empty()).unwrap_or(true) {
+                                    self.notes_status = Some("Please specify a filename".into());
+                                    std::path::PathBuf::new()
+                                } else if !p.is_absolute() && p.parent().map(|par| par.as_os_str().is_empty()).unwrap_or(true) {
+                                    // Just a filename (no directory component) - save to default notes dir
+                                    match std::fs::create_dir_all(&dir) {
+                                        Err(e) => {
+                                            self.notes_status = Some(format!("Failed to create notes dir '{}': {}", dir.display(), e));
+                                            std::path::PathBuf::new()
+                                        }
+                                        Ok(()) => {
+                                            let full_path = dir.join(&p);
+                                            self.notes_file_path = full_path.display().to_string();
+                                            full_path
+                                        }
+                                    }
+                                } else {
+                                    // Full or relative path with directories - use as provided
+                                    p
+                                }
+                            };
+                            if !path.as_os_str().is_empty() {
+                                let mut dir_ok = true;
+                                if let Some(parent) = path.parent() {
+                                    if !parent.as_os_str().is_empty() {
+                                        if let Err(e) = std::fs::create_dir_all(parent) {
+                                            self.notes_status = Some(format!("Failed to create dir: {}", e));
+                                            dir_ok = false;
+                                        }
+                                    }
+                                }
+                                if dir_ok {
+                                match std::fs::write(&path, &self.notes_text) {
+                                Ok(_) => {
+                                    self.notes_status = Some(format!("✓ Saved to {}", path.display()));
+                                    // Refresh the notes list
+                                    let dir = self.app_settings.notes_dir();
+                                    self.saved_notes_list.clear();
+                                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                                        for entry in entries.flatten() {
+                                            let p = entry.path();
+                                            if p.is_file() {
+                                                if let Some(ext) = p.extension() {
+                                                    if ext == "md" || ext == "txt" {
+                                                        self.saved_notes_list.push(p);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        self.saved_notes_list.sort();
+                                    }
+                                }
+                                Err(e) => self.notes_status = Some(format!("Save failed: {}", e)),
+                                }
+                                }
+                            }
+                        }
+                        if ui.button("📄 New").clicked() {
+                            self.notes_text.clear();
+                            self.notes_file_path.clear();
+                            self.notes_label = String::from("Note");
+                            self.notes_link_targets.clear();
+                            self.notes_existing_node = None;
+                            self.notes_status = Some("New note created".into());
+                            // Refresh notes list on new note creation
+                            let dir = self.app_settings.notes_dir();
+                            self.saved_notes_list.clear();
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                for entry in entries.flatten() {
+                                    let p = entry.path();
+                                    if p.is_file() {
+                                        if let Some(ext) = p.extension() {
+                                            if ext == "md" || ext == "txt" {
+                                                self.saved_notes_list.push(p);
+                                            }
+                                        }
+                                    }
+                                }
+                                self.saved_notes_list.sort();
+                            }
+                        }
+                        // Delete button - only enabled if a file is loaded
+                        let can_delete = !self.notes_file_path.trim().is_empty() 
+                            && std::path::Path::new(&self.notes_file_path).exists();
+                        ui.add_enabled_ui(can_delete, |ui| {
+                            if ui.button("🗑 Delete").on_hover_text("Delete this note").clicked() {
+                                self.note_delete_path = Some(std::path::PathBuf::from(&self.notes_file_path));
+                                self.confirm_note_delete = true;
+                            }
+                        });
+                    });
+                    
+                    // File path
+                    ui.horizontal(|ui| {
+                        ui.label("File:");
+                        ui.add(egui::TextEdit::singleline(&mut self.notes_file_path).desired_width(300.0));
+                    });
+                    if self.notes_file_path.trim().is_empty() {
+                        ui.small(format!("Will save to: {}", self.app_settings.notes_dir().display()));
+                    }
+                    
+                    if let Some(status) = &self.notes_status {
+                        ui.colored_label(
+                            if status.starts_with('✓') { Color32::from_rgb(100, 200, 100) } else { Color32::GRAY },
+                            status.clone()
+                        );
+                    }
+                    
+                    ui.separator();
+                    
+                    // Add to Graph section
+                    ui.collapsing("🔗 Add to Graph", |ui| {
+                        // Check if this note already exists as a node
+                        let existing_node = self.find_note_node_by_file(&self.notes_file_path);
+                        self.notes_existing_node = existing_node;
+                        
+                        if let Some(existing_id) = existing_node {
+                            ui.colored_label(Color32::from_rgb(100, 200, 100), 
+                                format!("Note node exists ({})", format_short_node(&self.db, existing_id, self.node_label_max_len)));
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Node Label:");
+                            ui.text_edit_singleline(&mut self.notes_label);
+                        });
+
+                        ui.separator();
+                        ui.label("Link to nodes:");
+                        
+                        // Show currently selected link targets
+                        if self.notes_link_targets.is_empty() {
+                            ui.small("No nodes selected");
+                        } else {
+                            let targets: Vec<NodeId> = self.notes_link_targets.iter().copied().collect();
+                            let mut to_remove: Option<NodeId> = None;
+                            for target_id in &targets {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format_short_node(&self.db, *target_id, self.node_label_max_len));
+                                    if ui.small_button("✕").clicked() {
+                                        to_remove = Some(*target_id);
+                                    }
+                                });
+                            }
+                            if let Some(id) = to_remove {
+                                self.notes_link_targets.remove(&id);
+                            }
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            let picking = matches!(self.pick_target, Some(PickTarget::NoteLink));
+                            let txt = if picking { "Cancel Pick" } else { "Pick Node" };
+                            if ui.button(txt).clicked() {
+                                self.pick_target = if picking { None } else { Some(PickTarget::NoteLink) };
+                            }
+                            if ui.button("Clear All").clicked() {
+                                self.notes_link_targets.clear();
+                            }
+                        });
+                        if matches!(self.pick_target, Some(PickTarget::NoteLink)) {
+                            ui.colored_label(Color32::YELLOW, "Click nodes on canvas to add links (click again to remove)");
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Relationship:");
+                            ui.text_edit_singleline(&mut self.notes_link_label);
+                        });
+
+                        ui.add_space(4.0);
+                        
+                        let button_text = if existing_node.is_some() { "🔄 Update Note Node" } else { "➕ Add Note to Graph" };
+                        if ui.button(button_text).clicked() {
+                            let label = if self.notes_label.trim().is_empty() {
+                                "Note".to_string()
+                            } else {
+                                self.notes_label.trim().to_string()
+                            };
+
+                            let mut meta = HashMap::new();
+                            // Only store file link and title, not the full content
+                            if !self.notes_file_path.trim().is_empty() {
+                                meta.insert("file".to_string(), self.notes_file_path.clone());
+                            }
+                            // Extract title from first line, or fall back to just the filename (not full path)
+                            let mut title_set = false;
+                            if let Some(first_line) = self.notes_text.lines().next() {
+                                let title = first_line.trim().trim_start_matches('#').trim();
+                                if !title.is_empty() {
+                                    meta.insert("title".to_string(), title.to_string());
+                                    title_set = true;
+                                }
+                            }
+                            if !title_set && !self.notes_file_path.trim().is_empty() {
+                                // Use just the filename as title, not the full path
+                                if let Some(filename) = std::path::Path::new(&self.notes_file_path).file_name() {
+                                    meta.insert("title".to_string(), filename.to_string_lossy().to_string());
+                                }
+                            }
+
+                            let node_id = if let Some(existing_id) = existing_node {
+                                // Update existing node
+                                if let Some(node) = self.db.nodes.get_mut(&existing_id) {
+                                    node.label = label;
+                                    node.metadata = meta;
+                                }
+                                existing_id
+                            } else {
+                                // Create new node
+                                let new_id = self.db.add_node(label, meta);
+                                self.re_cluster_pending = true;
+                                if let Some(r) = self.last_canvas_rect {
+                                    let idx = self.node_positions.len();
+                                    let pos = golden_spiral_position(r.center(), idx as u32, r);
+                                    self.node_positions.insert(new_id, pos);
+                                }
+                                new_id
+                            };
+
+                            // Add relationships to all selected targets (skip if already exists)
+                            let rel_label = if self.notes_link_label.trim().is_empty() {
+                                "REFERENCES".to_string()
+                            } else {
+                                self.notes_link_label.trim().to_string()
+                            };
+                            
+                            for target_id in &self.notes_link_targets {
+                                // Check if relationship already exists
+                                let rel_exists = self.db.relationships.values().any(|r| {
+                                    r.from_node == node_id && r.to_node == *target_id && r.label == rel_label
+                                });
+                                if !rel_exists && *target_id != node_id {
+                                    let _ = self.db.add_relationship(node_id, *target_id, rel_label.clone(), HashMap::new());
+                                }
+                            }
+
+                            // Reset pick state and clear link targets after update
+                            self.pick_target = None;
+                            self.notes_link_targets.clear();
+                            
+                            // Don't open node window after update - just mark dirty and show status
+                            self.mark_dirty();
+                            
+                            let status_msg = if existing_node.is_some() {
+                                "✓ Note node updated".to_string()
+                            } else {
+                                "✓ Note added to graph".to_string()
+                            };
+                            self.notes_status = Some(status_msg);
+                        }
+                    });
+                    
+                    ui.separator();
+                    
+                    // Main text editor area
+                    ui.label("Content:");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.notes_text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(15)
+                                .font(egui::TextStyle::Monospace)
+                        );
+                    });
+                    
+                    // Word/character/line count (Obsidian-like stats)
+                    ui.separator();
+                    let char_count = self.notes_text.len();
+                    let word_count = self.notes_text.split_whitespace().count();
+                    let line_count = self.notes_text.lines().count().max(1);
+                    ui.horizontal(|ui| {
+                        ui.small(format!("{} words", word_count));
+                        ui.separator();
+                        ui.small(format!("{} characters", char_count));
+                        ui.separator();
+                        ui.small(format!("{} lines", line_count));
+                    });
+                });
+            if !open {
+                self.show_note_editor = false;
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2595,7 +3272,18 @@ impl eframe::App for GraphApp {
                 let scroll = ui.input(|i| i.raw_scroll_delta.y);
                 if scroll != 0.0 {
                     let factor = (1.0 + scroll * 0.001).clamp(0.9, 1.1);
+                    let old_zoom = self.zoom;
                     self.zoom = (self.zoom * factor).clamp(0.25, 2.0);
+                    let actual_factor = self.zoom / old_zoom;
+
+                    if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        // Zoom around cursor:
+                        // (mouse_pos - center - pan_old) / zoom_old = (mouse_pos - center - pan_new) / zoom_new
+                        // pan_new = mouse_pos - center - (mouse_pos - center - pan_old) * actual_factor
+                        let center = available.center();
+                        self.pan = mouse_pos - center - (mouse_pos - center - self.pan) * actual_factor;
+                    }
+
                     // Show transient zoom HUD
                     self.zoom_hud_until = Some(Instant::now() + Duration::from_millis(1000));
                     ui.ctx().request_repaint_after(Duration::from_millis(16));
@@ -2631,10 +3319,12 @@ impl eframe::App for GraphApp {
             // Compute hover over nearest node within radius in screen space
             let mut hover_node: Option<NodeId> = None;
             if let Some(mouse_pos) = ui.ctx().pointer_hover_pos() {
-                let node_radius = 10.0 * self.zoom;
                 let mut best_d2 = f32::INFINITY;
-                for id in self.db.nodes.keys() {
+                for (id, node) in &self.db.nodes {
                     if let Some(pw) = self.node_positions.get(id) {
+                        let degree = node.out_rels.len() + node.in_rels.len();
+                        let base_radius = 10.0 + (degree as f32).sqrt() * 2.0;
+                        let node_radius = base_radius * self.zoom;
                         let ps = to_screen(*pw);
                         let dx = ps.x - mouse_pos.x; let dy = ps.y - mouse_pos.y;
                         let d2 = dx*dx + dy*dy;
@@ -2692,58 +3382,10 @@ impl eframe::App for GraphApp {
                 painter.line_segment([a, b], stroke);
             }
 
-                    // Relationship label at midpoint with improved LOD visibility and pill background
-                    let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
-                    let dir = Vec2::new(b.x - a.x, b.y - a.y);
-                    let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
-
-                    // Visibility: only show relationship label text when hovering over a connected node
-                    let show_label = incident_hover;
-
-                    if show_label && len > f32::EPSILON {
-                        // Perpendicular and tangential offsets, alternating per edge for separation
-                        let n = Vec2::new(-dir.y / len, dir.x / len);
-                        let t = Vec2::new(dir.x / len, dir.y / len);
-                        let mut seed = rel.from_node.as_u128() ^ (rel.to_node.as_u128().rotate_left(17)) ^ rel.id.as_u128();
-                        seed ^= seed >> 33;
-                        let side = if (seed & 1) == 0 { 1.0 } else { -1.0 };
-                        let lane = ((seed >> 1) & 3) as i32 - 1; // -1,0,1,2 → center-ish shift
-                        let perp_mag = (8.0 * self.zoom).clamp(4.0, 16.0);
-                        let tan_mag = (lane as f32) * 4.0 * self.zoom;
-                        let offset = n * (perp_mag * side as f32) + t * tan_mag;
-
-                        // Text styling
-                        let font = egui::FontId::proportional((12.0 * self.zoom).clamp(8.0, 16.0));
-                        let txt_color = if is_sel { Color32::from_rgb(30, 30, 30) } else { Color32::from_rgb(20, 20, 20) };
-                        let pill_fill = if is_sel {
-                            Color32::from_rgba_premultiplied(255, 220, 120, 220)
-                        } else if is_qsel || incident_hover {
-                            Color32::from_rgba_premultiplied(180, 235, 255, self.edge_label_bg_alpha)
-                        } else {
-                            Color32::from_rgba_premultiplied(245, 245, 245, self.edge_label_bg_alpha)
-                        };
-                        let _outline = Color32::from_rgba_premultiplied(0, 0, 0, 120);
-
-                        // Layout the text to size the pill
-                        let galley = ui.painter().layout_no_wrap(rel.label.clone(), font.clone(), txt_color);
-                        let pad = Vec2::new(6.0 * self.zoom, 3.0 * self.zoom);
-                        let pill_size = galley.size() + pad * 2.0;
-                        let center = mid + offset;
-                        let rect = Rect::from_center_size(center, pill_size);
-                        // Halo: draw a slightly larger translucent rect behind
-                        let halo_rect = Rect::from_center_size(center, pill_size + Vec2::new(4.0, 2.0));
-                        let rounding = 6.0 * self.zoom;
-                        painter.rect_filled(halo_rect, rounding, Color32::from_rgba_premultiplied(0, 0, 0, 25));
-                        // Pill background (optionally could add outline if API supports it)
-                        painter.rect_filled(rect, rounding, pill_fill);
-                        // Draw text centered
-                        painter.galley(center - galley.size() * 0.5, galley, txt_color);
-                    }
                 }
             }
 
             // Draw and interact with nodes
-            let node_radius_draw = 10.0 * self.zoom; // scale with zoom for easier hit testing
             let mut clicked_node: Option<NodeId> = None;
             let mut any_node_dragged = false;
             let was_dragging = self.dragging.is_some();
@@ -2757,6 +3399,11 @@ impl eframe::App for GraphApp {
                 // Safe to immutably read the node after the mutable borrow in get_or_init_position ends
                 let node = match self.db.nodes.get(&id) { Some(n) => n, None => continue };
                 let pos_screen = to_screen(pos_world);
+
+                let degree = node.out_rels.len() + node.in_rels.len();
+                let base_radius = 8.0 + (degree as f32).sqrt() * 5.0;
+                let node_radius_draw = base_radius * self.zoom;
+
                 let rect = Rect::from_center_size(pos_screen, Vec2::splat(node_radius_draw * 2.0));
                 let resp = ui.allocate_rect(rect, Sense::click_and_drag());
 
@@ -2777,7 +3424,7 @@ impl eframe::App for GraphApp {
                 // Hover tooltip: show readable details without cluttering the canvas
                 resp.on_hover_ui(|ui| {
                     ui.label(egui::RichText::new(
-                        format_short_node(&self.db, id)
+                        format_short_node(&self.db, id, self.node_label_max_len)
                     ).strong());
                     ui.monospace(format!("UUID: {}", id));
                     // Show degree (incident edges) and up to 5 properties
@@ -2796,6 +3443,35 @@ impl eframe::App for GraphApp {
                             shown += 1;
                         }
                         if n.metadata.len() > 5 { ui.small(format!("(+{} more)", n.metadata.len() - 5)); }
+                    }
+                    // Show relationships
+                    let mut rels: Vec<(bool, String, String)> = Vec::new(); // (is_outgoing, rel_label, other_node_name)
+                    for rel in self.db.relationships.values() {
+                        if rel.from_node == id {
+                            let other_name = format_short_node(&self.db, rel.to_node, self.node_label_max_len);
+                            rels.push((true, rel.label.clone(), other_name));
+                        } else if rel.to_node == id {
+                            let other_name = format_short_node(&self.db, rel.from_node, self.node_label_max_len);
+                            rels.push((false, rel.label.clone(), other_name));
+                        }
+                    }
+                    if !rels.is_empty() {
+                        rels.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+                        ui.separator();
+                        ui.small("Relationships:");
+                        let max_show = 6;
+                        for (i, (is_out, lbl, other)) in rels.iter().enumerate() {
+                            if i >= max_show { break; }
+                            let arrow = if *is_out { "→" } else { "←" };
+                            let arrow_color = if *is_out { Color32::from_rgb(100, 200, 100) } else { Color32::from_rgb(255, 180, 80) };
+                            ui.horizontal(|ui| {
+                                ui.colored_label(arrow_color, arrow);
+                                ui.small(format!("{} {}", lbl, other));
+                            });
+                        }
+                        if rels.len() > max_show {
+                            ui.small(format!("… and {} more", rels.len() - max_show));
+                        }
                     }
                 });
 
@@ -2821,17 +3497,10 @@ impl eframe::App for GraphApp {
                     );
                 }
 
-                // Label (no UUID) with label-based color coding and LOD rules
-                let show_label = if !self.lod_enabled { true } else {
-                    let many = self.db.nodes.len() >= self.lod_hide_labels_node_threshold;
-                    let zoom_ok = self.zoom >= self.lod_label_min_zoom;
-                    let is_hover = self.hover_node == Some(id);
-                    let is_query = self.query_selected_nodes.contains(&id);
-                    let is_sel = matches!(self.selected, Some(SelectedItem::Node(nid)) if nid == id);
-                    (!many && zoom_ok) || is_hover || is_query || is_sel
-                };
-                if show_label {
-                    let text = format_short_node(&self.db, id);
+                // Label (no UUID) with label-based color coding
+                // LOD: hide labels when zoomed out to reduce clutter
+                if self.zoom > 0.4 {
+                    let text = format_short_node(&self.db, id, self.node_label_max_len);
                     let label_color = GraphApp::color_for_label(&node.label);
                     let pos_text = pos_screen + Vec2::new(0.0, -node_radius_draw - 4.0);
                     // multi-direction halo for readability
@@ -2893,6 +3562,15 @@ impl eframe::App for GraphApp {
                                 self.pending_new_node_for_link = None;
                             }
                             self.pick_target = None;
+                        }
+                        PickTarget::NoteLink => {
+                            // Toggle the target node in the link targets set
+                            if self.notes_link_targets.contains(&id) {
+                                self.notes_link_targets.remove(&id);
+                            } else {
+                                self.notes_link_targets.insert(id);
+                            }
+                            // Don't clear pick_target - allow selecting multiple nodes
                         }
                     }
                 } else if self.multi_select_active {
@@ -3016,20 +3694,33 @@ impl eframe::App for GraphApp {
 
             // Smooth convergence using a simple spring-damper integration.
             // Neo4j-style aids for large graphs: center gravity and degree-aware repulsion.
-            let active = match self.converge_start { Some(t0) => t0.elapsed() < Duration::from_secs(5), None => false };
-            if active || any_node_dragged || self.dragging.is_some() {
+            // Physics timeout: 0 = indefinite, otherwise stop after N seconds
+            let timeout_secs = self.app_settings.physics_timeout_secs;
+            let active = match self.converge_start {
+                Some(t0) => {
+                    if timeout_secs == 0 {
+                        true // Indefinite movement
+                    } else {
+                        t0.elapsed() < Duration::from_secs(timeout_secs)
+                    }
+                }
+                None => false
+            };
+            // Pause physics when hovering over a node (so user can interact), but resume if dragging
+            if (active || any_node_dragged || self.dragging.is_some()) && (self.hover_node.is_none() || self.dragging.is_some()) {
                 // Nodes connected by relationships experience a spring force toward a target length.
                 // Nearby nodes experience a soft repulsive force to maintain spacing.
                 // We integrate per-node velocities with damping for fluid motion.
                 let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.033);
-                let target_dist = 120.0_f32; // preferred edge length in world space
-                let spring_k = 4.0_f32;      // edge spring stiffness (units/s^2)
-                let damping = 6.0_f32;       // velocity damping (units/s)
-                let min_sep = 90.0_f32;      // minimum comfortable spacing
-                let repulse_k = 10.0_f32;    // repulsion strength
-                let max_speed = 600.0_f32;   // clamp velocity magnitude (units/s)
-                let max_step = 5.0_f32;      // clamp displacement per frame (units)
-                let mouse_k = 20.0_f32;      // drag-to-mouse spring stiffness
+                let target_dist = 110.0_f32; // preferred edge length in world space (increased for better parsing)
+                let spring_k = 30.0_f32;     // edge spring stiffness
+                let damping = 12.0_f32;      // velocity damping
+                let min_sep = 100.0_f32;     // minimum comfortable spacing (increased for better parsing)
+                let _min_sep_val = min_sep;  // ensure it's used if needed below
+                let repulse_k = 45.0_f32;    // repulsion strength (increased slightly)
+                let max_speed = 2000.0_f32;  // clamp velocity magnitude (increased from 1000.0)
+                let max_step = 25.0_f32;     // clamp displacement per frame (increased from 10.0)
+                let _mouse_k = 120.0_f32;    // (unused; kept for reference if spring-drag is re-enabled)
 
                 // Ensure velocity entries exist for all positioned nodes
                 for id in self.db.nodes.keys().copied() {
@@ -3091,46 +3782,6 @@ impl eframe::App for GraphApp {
                     }
                 }
 
-                // Gravity: prefer local center-of-mass (COM) attraction when nodes cluster off-center; otherwise pull to window center.
-                if self.gravity_enabled {
-                    let center_world = from_screen(available.center());
-                    let k_g = self.gravity_strength;
-                    let r2 = self.com_gravity_radius * self.com_gravity_radius;
-                    // Iterate over a snapshot to avoid borrow conflicts
-                    let snapshot: Vec<(NodeId, Pos2)> = self.node_positions.iter().map(|(k,v)| (*k, *v)).collect();
-                    for (id, pos) in snapshot.iter() {
-                        // If we are dragging a multi-selection, and this node is part of the unit,
-                        // we lock out gravity.
-                        if !dragged_unit.is_empty() && self.dragging.is_some() && !self.multi_selected_nodes.is_empty() {
-                            if dragged_unit.contains(id) {
-                                continue;
-                            }
-                        }
-
-                        // Compute local COM of neighbors within radius (excluding self)
-                        let mut sum_x = 0.0f32;
-                        let mut sum_y = 0.0f32;
-                        let mut count = 0usize;
-                        for (oid, opos) in snapshot.iter() {
-                            if oid == id { continue; }
-                            let dx = opos.x - pos.x;
-                            let dy = opos.y - pos.y;
-                            if dx*dx + dy*dy <= r2 {
-                                sum_x += opos.x;
-                                sum_y += opos.y;
-                                count += 1;
-                            }
-                        }
-                        let target = if count >= self.com_gravity_min_neighbors {
-                            Pos2 { x: sum_x / (count as f32), y: sum_y / (count as f32) }
-                        } else {
-                            center_world
-                        };
-                        let dir = Vec2::new(target.x - pos.x, target.y - pos.y);
-                        *forces.entry(*id).or_insert(Vec2::ZERO) += dir * k_g;
-                    }
-                }
-
                 // Degree-aware repulsive separation for close pairs (O(N^2) but small/med graphs are fine)
                 let mut deg: HashMap<NodeId, usize> = HashMap::new();
                 for rel in self.db.relationships.values() {
@@ -3161,30 +3812,29 @@ impl eframe::App for GraphApp {
                         if dist < min_sep {
                             let dir = Vec2::new(dx / dist, dy / dist);
                             let overlap = (min_sep - dist).max(0.0);
-                            // Scale by node degrees to spread hubs a bit more
-                            let da = *deg.get(&a).unwrap_or(&0) as f32;
-                            let db = *deg.get(&b).unwrap_or(&0) as f32;
-                            let scale_a = 1.0 + self.hub_repulsion_scale * (da + 1.0).ln();
-                            let scale_b = 1.0 + self.hub_repulsion_scale * (db + 1.0).ln();
                             let f = dir * (repulse_k * overlap);
                             // push opposite directions
-                            *forces.entry(a).or_insert(Vec2::ZERO) -= f * scale_a;
-                            *forces.entry(b).or_insert(Vec2::ZERO) += f * scale_b;
+                            *forces.entry(a).or_insert(Vec2::ZERO) -= f;
+                            *forces.entry(b).or_insert(Vec2::ZERO) += f;
                         }
                     }
                 }
 
-                // Soft drag: apply a spring pulling the dragged node towards the mouse in world space
-                // If multiple nodes are selected, dragging one drags them all together by applying
-                // the same translation force vector to each selected node.
+                // Direct drag: move dragged nodes directly to follow the mouse for snappy response
+                // (like Obsidian). This bypasses physics for the dragged unit.
                 if let Some(drag_id) = self.dragging {
                     if let Some(mouse_pos_screen) = ui.input(|i| i.pointer.latest_pos()) {
                         let mouse_world = from_screen(mouse_pos_screen);
                         if let Some(p_drag) = self.node_positions.get(&drag_id).copied() {
-                            let dir = Vec2::new(mouse_world.x - p_drag.x, mouse_world.y - p_drag.y);
-                            // Apply force to all nodes in the unit
+                            let delta = Vec2::new(mouse_world.x - p_drag.x, mouse_world.y - p_drag.y);
+                            // Move all nodes in the dragged unit by the same delta
                             for nid in &dragged_unit {
-                                *forces.entry(*nid).or_insert(Vec2::ZERO) += dir * mouse_k;
+                                if let Some(p) = self.node_positions.get_mut(nid) {
+                                    p.x += delta.x;
+                                    p.y += delta.y;
+                                }
+                                // Zero velocity for dragged nodes to prevent drift after release
+                                self.node_velocities.insert(*nid, Vec2::ZERO);
                             }
                         }
                     }
@@ -3214,7 +3864,11 @@ impl eframe::App for GraphApp {
                     }
                     self.node_velocities.insert(id, v);
                 }
-                if any_move { self.mark_dirty(); }
+                if any_move {
+                    self.mark_dirty();
+                    // Request continuous repaint for smooth animation even without mouse movement
+                    ctx.request_repaint();
+                }
             } else {
                 // Timeout reached: stop convergence by zeroing velocities
                 for v in self.node_velocities.values_mut() { *v = Vec2::ZERO; }
@@ -3245,7 +3899,7 @@ impl eframe::App for GraphApp {
                 let mut to_remove_keys: Vec<String> = Vec::new();
                 let mut upsert_kv: Option<(String, String)> = None;
                 let mut delete_node = false;
-
+                let mut open_note_file: Option<String> = None;
                 egui::Window::new(format!("Node {} Details", id))
                     .id(egui::Id::new(("node_details", id)))
                     .open(&mut open)
@@ -3272,7 +3926,14 @@ impl eframe::App for GraphApp {
                                 ui.horizontal(|ui| {
                                     ui.label(&k);
                                     ui.label(":");
-                                    ui.monospace(&v);
+                                    // Make "file" metadata clickable to open note
+                                    if k == "file" && (v.ends_with(".md") || v.ends_with(".txt")) {
+                                        if ui.link(&v).on_hover_text("Click to open note").clicked() {
+                                            open_note_file = Some(v.clone());
+                                        }
+                                    } else {
+                                        ui.monospace(&v);
+                                    }
                                     if ui.button("Remove").clicked() { to_remove_keys.push(k.clone()); }
                                 });
                             }
@@ -3291,6 +3952,37 @@ impl eframe::App for GraphApp {
                                 }
                             }
                         });
+                        // Relationships section (collapsible, hidden by default)
+                        ui.separator();
+                        egui::CollapsingHeader::new("Relationships")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let mut rel_entries: Vec<(String, String, bool)> = Vec::new(); // (label, target_name, is_outgoing)
+                                for rel in self.db.relationships.values() {
+                                    if rel.from_node == id {
+                                        let target_name = format_short_node(&self.db, rel.to_node, self.node_label_max_len);
+                                        rel_entries.push((rel.label.clone(), target_name, true));
+                                    } else if rel.to_node == id {
+                                        let source_name = format_short_node(&self.db, rel.from_node, self.node_label_max_len);
+                                        rel_entries.push((rel.label.clone(), source_name, false));
+                                    }
+                                }
+                                if rel_entries.is_empty() {
+                                    ui.label("<no relationships>");
+                                } else {
+                                    rel_entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                                    for (label, target, is_out) in &rel_entries {
+                                        ui.horizontal(|ui| {
+                                            let arrow = if *is_out { "→" } else { "←" };
+                                            let arrow_color = if *is_out { Color32::from_rgb(120, 220, 160) } else { Color32::from_rgb(220, 160, 120) };
+                                            ui.colored_label(arrow_color, arrow);
+                                            ui.label(label);
+                                            ui.monospace(target);
+                                        });
+                                    }
+                                }
+                            });
+
                         ui.separator();
                         if ui.button(egui::RichText::new("Delete Node").color(Color32::RED)).clicked() {
                             delete_node = true;
@@ -3311,7 +4003,20 @@ impl eframe::App for GraphApp {
                     if self.db.remove_node(id) {
                         self.node_positions.remove(&id);
                         if self.selected == Some(SelectedItem::Node(id)) { self.selected = None; }
-                        self.re_cluster_pending = true; self.mark_dirty();
+                        self.mark_dirty();
+                    }
+                }
+                // Open note file in editor if clicked
+                if let Some(file_path) = open_note_file {
+                    let path = std::path::PathBuf::from(&file_path);
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        self.notes_text = content;
+                        self.notes_file_path = file_path;
+                        self.notes_status = Some(format!("Loaded: {}", path.file_name().unwrap_or_default().to_string_lossy()));
+                        self.show_note_editor = true;
+                    } else {
+                        self.notes_status = Some(format!("Failed to load: {}", file_path));
+                        self.show_note_editor = true;
                     }
                 }
                 if !open { nodes_to_close.push(id); }
@@ -3411,7 +4116,7 @@ impl eframe::App for GraphApp {
                 if delete_rel {
                     if self.db.remove_relationship(rid) {
                         if self.selected == Some(SelectedItem::Rel(rid)) { self.selected = None; }
-                        self.re_cluster_pending = true; self.mark_dirty();
+                        self.mark_dirty();
                     }
                 }
                 if !open { rels_to_close.push(rid); }
@@ -3441,10 +4146,10 @@ impl eframe::App for GraphApp {
             None => {}
         }
 
-        // Autosave logic: only after edits (5 seconds after the last change, prominent)
+        // Autosave logic: only after edits (5 seconds after the last change, subtle)
         let now = Instant::now();
         if self.dirty && now.duration_since(self.last_change) >= Duration::from_secs(5) {
-            self.save_now_with(NoticeStyle::Prominent);
+            self.save_now_with(NoticeStyle::Subtle);
         }
 
         // Load Versions modal
@@ -3560,34 +4265,28 @@ fn _short_uuid(id: Uuid) -> String {
     s.chars().rev().take(8).collect::<Vec<char>>().into_iter().rev().collect()
 }
 
-fn format_short_node(db: &GraphDatabase, id: NodeId) -> String {
+fn format_short_node(db: &GraphDatabase, id: NodeId, max_len: usize) -> String {
     // Render-friendly node caption without UUID to improve readability on canvas.
-    // Prefer a human-friendly metadata field if present.
+    // Use the shortest non-empty metadata string value; fall back to label only if no metadata.
     if let Some(n) = db.nodes.get(&id) {
-        // Prefer commonly used human-readable keys
-        if let Some(name) = n.metadata.get("name").filter(|s| !s.is_empty()) {
-            return name.clone();
+        // Find the shortest non-empty metadata value
+        let shortest = n.metadata.values()
+            .filter(|s| !s.is_empty())
+            .min_by_key(|s| s.len());
+        
+        let text = if let Some(val) = shortest {
+            val.clone()
+        } else {
+            // Fallback to label only when no metadata exists
+            n.label.clone()
+        };
+        
+        // Truncate if longer than max_len
+        if max_len > 0 && text.chars().count() > max_len {
+            let truncated: String = text.chars().take(max_len).collect();
+            return format!("{}…", truncated);
         }
-        if let Some(title) = n.metadata.get("title").filter(|s| !s.is_empty()) {
-            return title.clone();
-        }
-        if let Some(keyword) = n.metadata.get("keyword").filter(|s| !s.is_empty()) {
-            return keyword.clone();
-        }
-        // Requirement: Use one of the values from a node's metadata as the rendered name
-        // If no preferred key exists but metadata has entries, use a deterministic choice:
-        // pick the first non-empty value by alphabetical key order.
-        if !n.metadata.is_empty() {
-            let mut keys: Vec<&String> = n.metadata.keys().collect();
-            keys.sort();
-            for k in keys {
-                if let Some(val) = n.metadata.get(k).filter(|s| !s.is_empty()) {
-                    return val.clone();
-                }
-            }
-        }
-        // Fallback to label only (no short uuid)
-        return n.label.clone();
+        return text;
     }
     // Unknown node fallback
     "<unknown>".to_string()

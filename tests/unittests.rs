@@ -21,6 +21,116 @@ fn ids_from_rows(rows: &[QueryResultRow]) -> Vec<Uuid> {
 }
 
 #[test]
+fn cypher_timestamp_function() {
+    let mut db = new_db();
+    execute_query(&mut db, "CREATE (:Event {name: 'First'})").unwrap();
+    // sleep for a tiny bit to ensure timestamp difference if needed, 
+    // though uuid7 has sub-ms precision, sometimes it might be too fast.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    execute_query(&mut db, "CREATE (:Event {name: 'Second'})").unwrap();
+
+    // Test sorting by timestamp
+    let q = "MATCH (e:Event) RETURN e.name ORDER BY timestamp(e) DESC";
+    let out = execute_query(&mut db, q).unwrap();
+    assert_eq!(out.rows.len(), 2);
+    if let QueryResultRow::Info(name) = &out.rows[0] {
+        assert_eq!(name, "Second");
+    } else { panic!("Expected Info row"); }
+    if let QueryResultRow::Info(name) = &out.rows[1] {
+        assert_eq!(name, "First");
+    } else { panic!("Expected Info row"); }
+
+    // Test WHERE with timestamp
+    // We get the timestamp of the first node to use in a query
+    let q_ts = "MATCH (e:Event {name: 'First'}) RETURN timestamp(e)";
+    let out_ts = execute_query(&mut db, q_ts).unwrap();
+    let ts_val: f64 = match &out_ts.rows[0] {
+        QueryResultRow::Info(s) => s.parse().unwrap(),
+        _ => panic!("Expected timestamp info"),
+    };
+
+    let q_where = format!("MATCH (e:Event) WHERE timestamp(e) > {} RETURN e.name", ts_val);
+    let out_where = execute_query(&mut db, &q_where).unwrap();
+    assert_eq!(out_where.rows.len(), 1);
+    if let QueryResultRow::Info(name) = &out_where.rows[0] {
+        assert_eq!(name, "Second");
+    } else { panic!("Expected Info row"); }
+}
+
+#[test]
+fn cypher_create_relationship_with_variable_references() {
+    // Test that CREATE (p1)-[:REL]->(c1) works when p1 and c1 are defined in prior CREATE statements
+    let mut db = new_db();
+    
+    // This is the exact use case from the issue: create nodes then create relationship referencing them
+    let query = r#"
+        CREATE (p1:Person {name: 'Sarah Chen', age: '38', role: 'CEO'})
+        CREATE (c1:Company {name: 'TechVentures Inc', founded: '2018', employees: '250'})
+        CREATE (p1)-[:FOUNDED {year: '2018', equity: '25'}]->(c1)
+    "#;
+    
+    let result = execute_query(&mut db, query);
+    assert!(result.is_ok(), "Multi-CREATE with relationship should succeed: {:?}", result.err());
+    
+    // Verify nodes were created
+    let nodes = execute_query(&mut db, "MATCH (n) RETURN n").unwrap();
+    assert_eq!(nodes.rows.len(), 2, "Should have 2 nodes");
+    
+    // Verify relationship was created
+    let rels = execute_query(&mut db, "MATCH ()-[r]->() RETURN r").unwrap();
+    assert_eq!(rels.rows.len(), 1, "Should have 1 relationship");
+    
+    // Verify the relationship connects the right nodes
+    let path = execute_query(&mut db, "MATCH (p:Person)-[r:FOUNDED]->(c:Company) RETURN p, r, c").unwrap();
+    assert_eq!(path.rows.len(), 3, "Should return person, relationship, and company");
+    
+    // Verify relationship metadata
+    if let QueryResultRow::Relationship { label, metadata, .. } = &path.rows[1] {
+        assert_eq!(label, "FOUNDED");
+        assert_eq!(metadata.get("year"), Some(&"2018".to_string()));
+        assert_eq!(metadata.get("equity"), Some(&"25".to_string()));
+    } else {
+        panic!("Expected relationship row");
+    }
+}
+
+#[test]
+fn cypher_deduplication_query() {
+    let mut db = new_db();
+    // Create duplicate URL nodes with same ShortDescription
+    execute_query(&mut db, "CREATE (:URL {ShortDescription: 'Same', url: 'http://a.com'})").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    execute_query(&mut db, "CREATE (:URL {ShortDescription: 'Same', url: 'http://b.com'})").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    execute_query(&mut db, "CREATE (:URL {ShortDescription: 'Same', url: 'http://c.com'})").unwrap();
+
+    // Verify we have 3 nodes
+    let out = execute_query(&mut db, "MATCH (n:URL) RETURN n").unwrap();
+    assert_eq!(out.rows.len(), 3);
+
+    // Simplified deduplication: group by ShortDescription, collect nodes, delete all but newest
+    // This uses a single WITH clause with collect() which groups and outputs duplicates for deletion
+    let dedupe_query = "
+        MATCH (n:URL)
+        WITH n.ShortDescription AS desc, collect(n) AS nodes
+        DETACH DELETE nodes
+    ";
+    let res = execute_query(&mut db, dedupe_query);
+    
+    match res {
+        Ok(outcome) => {
+            println!("Outcome: mutated={}, nodes={}, rels={}", outcome.mutated, outcome.affected_nodes, outcome.affected_relationships);
+            // Check how many nodes remain
+            let check = execute_query(&mut db, "MATCH (n:URL) RETURN n").unwrap();
+            assert_eq!(check.rows.len(), 1, "Should have only 1 node left after deduplication");
+        },
+        Err(e) => {
+            panic!("Deduplication query failed: {}", e);
+        }
+    }
+}
+
+#[test]
 fn cypher_params_in_pattern_and_where() {
     let mut db = new_db();
     // Seed data
@@ -249,7 +359,7 @@ fn gql_multi_statement_execution_aggregates_counts() {
 fn cypher_match_merge_pairwise_creation() {
     let mut db = new_db();
     // Create 3 nodes with same label 'asdf'
-    let out = execute_query(
+    let _out = execute_query(
         &mut db,
         r#"
         CREATE NODE asdf {name:"n1"};
@@ -385,7 +495,7 @@ fn cypher_where_multiple_equals_clauses() {
 fn cypher_variable_length_path_basic() {
     let mut db = new_db();
     // Create chain X1 -[:R]-> X2 -[:R]-> X3
-    let rows = execute_query(&mut db, r#"
+    let _rows = execute_query(&mut db, r#"
         CREATE (:X {name:'X1'});
         CREATE (:X {name:'X2'});
         CREATE (:X {name:'X3'});
