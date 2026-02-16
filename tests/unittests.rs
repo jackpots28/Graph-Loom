@@ -58,6 +58,43 @@ fn cypher_timestamp_function() {
 }
 
 #[test]
+fn cypher_create_relationship_with_variable_references() {
+    // Test that CREATE (p1)-[:REL]->(c1) works when p1 and c1 are defined in prior CREATE statements
+    let mut db = new_db();
+    
+    // This is the exact use case from the issue: create nodes then create relationship referencing them
+    let query = r#"
+        CREATE (p1:Person {name: 'Sarah Chen', age: '38', role: 'CEO'})
+        CREATE (c1:Company {name: 'TechVentures Inc', founded: '2018', employees: '250'})
+        CREATE (p1)-[:FOUNDED {year: '2018', equity: '25'}]->(c1)
+    "#;
+    
+    let result = execute_query(&mut db, query);
+    assert!(result.is_ok(), "Multi-CREATE with relationship should succeed: {:?}", result.err());
+    
+    // Verify nodes were created
+    let nodes = execute_query(&mut db, "MATCH (n) RETURN n").unwrap();
+    assert_eq!(nodes.rows.len(), 2, "Should have 2 nodes");
+    
+    // Verify relationship was created
+    let rels = execute_query(&mut db, "MATCH ()-[r]->() RETURN r").unwrap();
+    assert_eq!(rels.rows.len(), 1, "Should have 1 relationship");
+    
+    // Verify the relationship connects the right nodes
+    let path = execute_query(&mut db, "MATCH (p:Person)-[r:FOUNDED]->(c:Company) RETURN p, r, c").unwrap();
+    assert_eq!(path.rows.len(), 3, "Should return person, relationship, and company");
+    
+    // Verify relationship metadata
+    if let QueryResultRow::Relationship { label, metadata, .. } = &path.rows[1] {
+        assert_eq!(label, "FOUNDED");
+        assert_eq!(metadata.get("year"), Some(&"2018".to_string()));
+        assert_eq!(metadata.get("equity"), Some(&"25".to_string()));
+    } else {
+        panic!("Expected relationship row");
+    }
+}
+
+#[test]
 fn cypher_deduplication_query() {
     let mut db = new_db();
     // Create duplicate URL nodes with same ShortDescription
@@ -322,7 +359,7 @@ fn gql_multi_statement_execution_aggregates_counts() {
 fn cypher_match_merge_pairwise_creation() {
     let mut db = new_db();
     // Create 3 nodes with same label 'asdf'
-    let out = execute_query(
+    let _out = execute_query(
         &mut db,
         r#"
         CREATE NODE asdf {name:"n1"};
@@ -458,7 +495,7 @@ fn cypher_where_multiple_equals_clauses() {
 fn cypher_variable_length_path_basic() {
     let mut db = new_db();
     // Create chain X1 -[:R]-> X2 -[:R]-> X3
-    let rows = execute_query(&mut db, r#"
+    let _rows = execute_query(&mut db, r#"
         CREATE (:X {name:'X1'});
         CREATE (:X {name:'X2'});
         CREATE (:X {name:'X3'});
