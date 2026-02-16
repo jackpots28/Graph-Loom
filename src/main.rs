@@ -4,6 +4,7 @@ mod graph_utils;
 mod gui;
 mod persistence;
 mod api;
+mod semantic;
 
 use std::collections::HashMap;
 use graph_utils::graph::GraphDatabase;
@@ -214,11 +215,23 @@ fn main() -> eframe::Result {
 #[cfg(feature = "api")]
 fn run_background(settings: persistence::settings::AppSettings) -> eframe::Result {
     use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::api;
     use crate::gql::query_interface;
 
     eprintln!("[Graph-Loom] Running in BACKGROUND mode. No GUI will be shown.");
     eprintln!("[Graph-Loom] Press Ctrl+C to stop.");
+
+    // Set up Ctrl+C handler
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        eprintln!("\n[Graph-Loom] Ctrl+C received, shutting down...");
+        r.store(false, Ordering::SeqCst);
+    }) {
+        eprintln!("[Graph-Loom] Warning: Failed to set Ctrl+C handler: {}", e);
+    }
 
     let mut db = if let Ok(Some(state)) = persist::load_active() {
         eprintln!("[Graph-Loom] Loaded existing state.");
@@ -245,7 +258,7 @@ fn run_background(settings: persistence::settings::AppSettings) -> eframe::Resul
     let mut last_save = Instant::now();
     let mut dirty = false;
 
-    loop {
+    while running.load(Ordering::SeqCst) {
         // Periodic save
         if dirty && last_save.elapsed() > Duration::from_secs(5) {
             // Note: in background mode, db is local so we can use it to create owned state
@@ -287,4 +300,22 @@ fn run_background(settings: persistence::settings::AppSettings) -> eframe::Resul
             let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
         }
     }
+
+    // Final save before exit
+    if dirty {
+        let state = persist::AppStateFile::from_runtime_owned(
+            db.clone(),
+            &HashMap::new(),
+            egui::Vec2::ZERO,
+            1.0,
+        );
+        if let Err(e) = persist::save_active(&state) {
+            eprintln!("[Graph-Loom] Final save failed: {}", e);
+        } else {
+            eprintln!("[Graph-Loom] Final state saved.");
+        }
+    }
+
+    eprintln!("[Graph-Loom] Background mode stopped.");
+    Ok(())
 }
