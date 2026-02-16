@@ -8,6 +8,19 @@ pub type NodeId = Uuid;
 type Key = String;
 type Value = String;
 
+/// Returns current Unix timestamp in milliseconds
+pub fn current_timestamp_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Default timestamp for serde deserialization of legacy data
+fn default_timestamp() -> i64 {
+    0
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Node {
@@ -16,6 +29,12 @@ pub struct Node {
     pub metadata: HashMap<Key, Value>,
     pub out_rels: Vec<Uuid>,
     pub in_rels: Vec<Uuid>,
+    /// Unix timestamp (milliseconds) when the node was created
+    #[serde(default = "default_timestamp")]
+    pub created_at: i64,
+    /// Unix timestamp (milliseconds) when the node was last updated
+    #[serde(default = "default_timestamp")]
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,6 +44,12 @@ pub struct Relationship {
     pub to_node: NodeId,
     pub label: String,
     pub metadata: HashMap<Key, Value>,
+    /// Unix timestamp (milliseconds) when the relationship was created
+    #[serde(default = "default_timestamp")]
+    pub created_at: i64,
+    /// Unix timestamp (milliseconds) when the relationship was last updated
+    #[serde(default = "default_timestamp")]
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,12 +73,15 @@ impl GraphDatabase {
     // Add a node and return its new ID
     pub fn add_node(&mut self, label: String, metadata: HashMap<Key, Value>) -> NodeId {
         let id = Uuid::now_v7();
+        let now = current_timestamp_ms();
         let node = Node {
             id,
             label: label.clone(),
             metadata,
             out_rels: Vec::new(),
             in_rels: Vec::new(),
+            created_at: now,
+            updated_at: now,
         };
         self.nodes.insert(id, node);
         self.label_index.entry(label).or_default().push(id);
@@ -70,7 +98,8 @@ impl GraphDatabase {
     ) -> Option<Uuid> {
         if self.nodes.contains_key(&from_node) && self.nodes.contains_key(&to_node) {
             let id = Uuid::now_v7();
-            let relationship = Relationship { id, from_node, to_node, label, metadata };
+            let now = current_timestamp_ms();
+            let relationship = Relationship { id, from_node, to_node, label, metadata, created_at: now, updated_at: now };
             self.relationships.insert(id, relationship);
 
             // Update adjacency lists
