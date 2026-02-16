@@ -1149,23 +1149,58 @@ fn parse(query: &str) -> Result<Vec<Clause>> {
         }
         return Ok(clauses);
     } else if up.starts_with("CREATE") {
-        // Support CREATE followed by any whitespace/newlines before patterns
+        // Support multiple CREATE clauses: CREATE (a) CREATE (a)-[:R]->(b) ...
+        // Split on CREATE keyword boundaries while preserving patterns
         let body = &q[6..].trim();
-        let mut parts = body.splitn(2, " RETURN ");
-        let pats = match parts.next() {
-            Some(s) => s,
-            None => return Err(anyhow!("missing CREATE patterns")),
+        
+        // Check for RETURN at the end
+        let body_up = body.to_uppercase();
+        let (creates_part, return_part) = if let Some(ret_idx) = find_keyword_boundary(&body_up, "RETURN") {
+            (&body[..ret_idx], Some(&body[ret_idx..]))
+        } else {
+            (*body, None)
         };
-        let mut patterns = Vec::new();
-        for pat in split_top_level_comma(pats) { if !pat.is_empty() { patterns.push(parse_pattern(&pat)?); } }
-        clauses.push(Clause::Create { patterns });
-        if let Some(ret) = parts.next() {
-            // Allow ORDER BY/LIMIT/SKIP after RETURN even in CREATE ... RETURN
-            let ret_trim = ret.trim();
-            let body = ret_trim;
+        
+        // Split by CREATE keyword to handle multiple CREATE clauses
+        let mut remaining = creates_part.to_string();
+        loop {
+            let rem_up = remaining.to_uppercase();
+            // Find next CREATE keyword (not at position 0)
+            if let Some(next_create) = find_keyword_boundary(&rem_up[1..], "CREATE") {
+                let next_idx = next_create + 1; // offset by 1 since we searched from position 1
+                let first_part = remaining[..next_idx].trim();
+                if !first_part.is_empty() {
+                    let mut patterns = Vec::new();
+                    for pat in split_top_level_comma(first_part) { 
+                        if !pat.is_empty() { patterns.push(parse_pattern(&pat)?); } 
+                    }
+                    if !patterns.is_empty() {
+                        clauses.push(Clause::Create { patterns });
+                    }
+                }
+                // Skip "CREATE" keyword for next iteration
+                remaining = remaining[next_idx + 6..].trim().to_string();
+            } else {
+                // No more CREATE keywords, process remaining
+                if !remaining.is_empty() {
+                    let mut patterns = Vec::new();
+                    for pat in split_top_level_comma(&remaining) { 
+                        if !pat.is_empty() { patterns.push(parse_pattern(&pat)?); } 
+                    }
+                    if !patterns.is_empty() {
+                        clauses.push(Clause::Create { patterns });
+                    }
+                }
+                break;
+            }
+        }
+        
+        // Handle RETURN clause if present
+        if let Some(ret) = return_part {
+            let ret_body = ret.strip_prefix("RETURN").or_else(|| ret.strip_prefix("return")).unwrap_or(ret).trim();
             let mut limit: Option<usize> = None;
             let mut skip: Option<usize> = None;
-            let mut working = body.to_string();
+            let mut working = ret_body.to_string();
             loop {
                 let up = working.to_uppercase();
                 if let Some(idx) = up.rfind(" LIMIT ") {

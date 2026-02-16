@@ -3,11 +3,46 @@ use std::collections::HashMap;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use time::{macros::format_description, OffsetDateTime};
 use uuid::Uuid;
 use rayon::prelude::*;
 
 use crate::graph_utils::graph::{GraphDatabase, NodeId};
+use crate::semantic::embeddings::NodeEmbeddingIndex;
+
+/// Global embedding cache for reusing computed embeddings across queries
+#[allow(dead_code)]
+static EMBEDDING_CACHE: once_cell::sync::Lazy<Mutex<Option<(NodeEmbeddingIndex, usize)>>> = 
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+/// Set the global embedding cache
+#[allow(dead_code)]
+pub fn set_embedding_cache(index: NodeEmbeddingIndex, node_count: usize) {
+    if let Ok(mut cache) = EMBEDDING_CACHE.lock() {
+        *cache = Some((index, node_count));
+    }
+}
+
+/// Get a reference to the embedding cache (returns None if not initialized)
+#[allow(dead_code)]
+pub fn get_embedding_cache() -> Option<(NodeEmbeddingIndex, usize)> {
+    if let Ok(cache) = EMBEDDING_CACHE.lock() {
+        cache.clone()
+    } else {
+        None
+    }
+}
+
+/// Clear the embedding cache
+#[allow(dead_code)]
+pub fn clear_embedding_cache() {
+    if let Ok(mut cache) = EMBEDDING_CACHE.lock() {
+        *cache = None;
+    }
+}
+use crate::graph_utils::algorithms::{pagerank, betweenness_centrality, shortest_path, astar_path, all_paths};
+use crate::graph_utils::temporal::{get_timeline, get_timestamp_range, nodes_in_range, graph_at_time};
 use super::cypher_spec::{execute_cypher, execute_cypher_with_params};
 
 #[derive(Debug, Clone)]
@@ -100,10 +135,81 @@ fn _split_statements(input: &str) -> Vec<String> {
     statements
 }
 
+/// Batch consecutive CREATE statements into single combined statements.
+/// This allows variable bindings from one CREATE to be available in subsequent CREATEs.
+/// e.g., "CREATE (p1:Person)" followed by "CREATE (p1)-[:REL]->(c1)" becomes
+/// "CREATE (p1:Person) CREATE (p1)-[:REL]->(c1)" so p1 is bound when the relationship is created.
+fn batch_consecutive_creates(statements: &[String]) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let mut create_batch: Vec<String> = Vec::new();
+    
+    for stmt in statements {
+        let trimmed = stmt.trim();
+        let upper = trimmed.to_uppercase();
+        
+        // Check if this is a Cypher-style CREATE (not legacy CREATE NODE/REL)
+        let is_cypher_create = upper.starts_with("CREATE") 
+            && trimmed.len() > 6 
+            && trimmed[6..].trim_start().starts_with('(');
+        
+        if is_cypher_create {
+            create_batch.push(trimmed.to_string());
+        } else {
+            // Flush any accumulated CREATE batch
+            if !create_batch.is_empty() {
+                // Join with newline so parser sees multiple CREATE clauses
+                result.push(create_batch.join("\n"));
+                create_batch.clear();
+            }
+            result.push(trimmed.to_string());
+        }
+    }
+    
+    // Flush remaining CREATE batch
+    if !create_batch.is_empty() {
+        result.push(create_batch.join("\n"));
+    }
+    
+    result
+}
+
+/// Extract label from a MATCH clause like "MATCH (n:Person)" -> Some("Person")
+fn extract_match_label(upper_query: &str) -> Option<String> {
+    // Look for pattern like "MATCH (var:Label)" or "MATCH (:Label)"
+    if let Some(match_idx) = upper_query.find("MATCH") {
+        let after_match = &upper_query[match_idx + 5..];
+        if let Some(paren_idx) = after_match.find('(') {
+            let after_paren = &after_match[paren_idx + 1..];
+            // Find the colon that indicates a label
+            if let Some(colon_idx) = after_paren.find(':') {
+                let after_colon = &after_paren[colon_idx + 1..];
+                // Extract label until ) or space or {
+                let label_end = after_colon.find(|c: char| c == ')' || c == ' ' || c == '{' || c == '-' || c == ']')
+                    .unwrap_or(after_colon.len());
+                let label = after_colon[..label_end].trim();
+                if !label.is_empty() {
+                    return Some(label.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome> {
     // Normalize line endings: convert CRLF to LF and remove stray CR
     let normalized = query.replace("\r\n", "\n").replace('\r', "\n");
-    let trimmed = normalized.trim();
+    let mut trimmed = normalized.trim();
+    
+    // Strip outer quotes if the entire query is wrapped in them (common from CLI)
+    if (trimmed.starts_with('"') && trimmed.ends_with('"')) || 
+       (trimmed.starts_with('\'') && trimmed.ends_with('\'')) {
+        if trimmed.len() >= 2 {
+            trimmed = &trimmed[1..trimmed.len()-1];
+            trimmed = trimmed.trim();
+        }
+    }
+    
     if trimmed.is_empty() {
         return Err(anyhow!("empty query"));
     }
@@ -112,17 +218,21 @@ pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome
     let mut outcome = QueryOutcome::default();
     let mut any_mut = false;
     let statements = _split_statements(trimmed);
-    for stmt in statements {
+    
+    // Batch consecutive CREATE statements so variable bindings persist across them
+    // e.g., CREATE (p1:Person) followed by CREATE (p1)-[:REL]->(c1) needs p1 bound
+    let batched_statements = batch_consecutive_creates(&statements);
+    
+    for stmt in batched_statements {
         let stmt = stmt.trim();
         if stmt.is_empty() { continue; }
         let upper = stmt.to_uppercase();
-        println!("DEBUG: Executing statement: [{}]", stmt);
         let res = if upper.starts_with("MATCH (") && upper.contains(" MERGE ") {
             // Legacy minimal Cypher-style pairwise support (kept for compatibility)
             exec_cypher_match_merge(db, stmt)
         // If the statement appears to be OpenCypher, route to the Cypher engine.
         // Detect by keywords and forms that are NOT the legacy custom commands.
-        } else if (upper.starts_with("MATCH") && (stmt[5..].trim_start().starts_with('(') || stmt[5..].trim_start().starts_with("(") || (stmt[5..].trim_start().contains('.') && !stmt[5..].trim_start().starts_with("NODE ") && !stmt[5..].trim_start().starts_with("REL ")))) ||
+        } else if (upper.starts_with("MATCH") && !upper.contains("CALL ") && (stmt[5..].trim_start().starts_with('(') || stmt[5..].trim_start().starts_with("(") || (stmt[5..].trim_start().contains('.') && !stmt[5..].trim_start().starts_with("NODE ") && !stmt[5..].trim_start().starts_with("REL ")))) ||
         // WITH is Cypher-only
         upper.starts_with("WITH ") ||
         // UNWIND is Cypher-only
@@ -142,9 +252,9 @@ pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome
         upper.starts_with("DETACH DELETE ") ||
         // CREATE with '(' pattern (avoid legacy CREATE NODE/REL)
         (upper.starts_with("CREATE") && stmt[6..].trim_start().starts_with('(')) ||
-        // Catch-all for multi-clause queries
-        (upper.contains("WITH ") && (upper.contains("MATCH ") || upper.contains("RETURN "))) ||
-        (upper.contains("UNWIND ") && upper.contains("WITH ")) {
+        // Catch-all for multi-clause queries (but NOT if it contains CALL - those need special handling)
+        (upper.contains("WITH ") && (upper.contains("MATCH ") || upper.contains("RETURN ")) && !upper.contains("CALL ")) ||
+        (upper.contains("UNWIND ") && upper.contains("WITH ") && !upper.contains("CALL ")) {
             let rows = execute_cypher(db, stmt)?;
             // conservatively mark mutated if statement contains mutating keywords
             let mutated = upper.contains("CREATE")
@@ -166,6 +276,20 @@ pub fn execute_query(db: &mut GraphDatabase, query: &str) -> Result<QueryOutcome
             exec_delete_node(db, &stmt[12..]).map(|cnt| (Vec::new(), cnt, 0, true))
         } else if upper.starts_with("DELETE REL ") {
             exec_delete_rel(db, &stmt[11..]).map(|cnt| (Vec::new(), 0, cnt, true))
+        } else if upper.starts_with("CALL ") {
+            exec_call_procedure(db, &stmt[5..])
+        } else if upper.contains("CALL ") {
+            // Query contains CALL but doesn't start with it (e.g., "MATCH ... WITH ... CALL embedding.similar(...)")
+            // Extract label filter from MATCH clause if present (e.g., "MATCH (n:Person)")
+            let label_filter = extract_match_label(&upper);
+            
+            // Extract and execute just the CALL portion, injecting label filter if needed
+            if let Some(call_idx) = upper.find("CALL ") {
+                let call_part = &stmt[call_idx + 5..];
+                exec_call_procedure_with_label(db, call_part, label_filter)
+            } else {
+                return Err(anyhow!("unrecognized statement: {}", stmt));
+            }
         } else {
             return Err(anyhow!("unrecognized statement: {}", stmt));
         }?;
@@ -265,6 +389,31 @@ pub fn _execute_and_log_with_params(
     let res = execute_query_with_params(db, query, params);
     log_query(query, &res);
     res
+}
+
+/// Execute a CALL procedure with an optional label filter from preceding MATCH clause
+fn exec_call_procedure_with_label(
+    db: &mut GraphDatabase,
+    rest: &str,
+    label_filter: Option<String>,
+) -> Result<(Vec<QueryResultRow>, usize, usize, bool)> {
+    let upper = rest.to_uppercase();
+    
+    // For embedding.similar and embedding.threshold, inject label filter if not already provided
+    if upper.starts_with("EMBEDDING.SIMILAR") || upper.starts_with("EMBEDDING.THRESHOLD") {
+        if let Some(label) = label_filter {
+            // Check if a label filter is already provided (3rd argument for similar, would need different handling)
+            let args = extract_call_args(rest)?;
+            if upper.starts_with("EMBEDDING.SIMILAR") && args.len() == 2 {
+                // Inject label as 3rd argument: embedding.similar("query", k, "Label")
+                let new_call = format!("embedding.similar(\"{}\", {}, \"{}\")", args[0], args[1], label);
+                return exec_call_procedure(db, &new_call);
+            }
+        }
+    }
+    
+    // Fall back to normal procedure execution
+    exec_call_procedure(db, rest)
 }
 
 // Split on a top-level WHERE (case-insensitive). Returns (head, where_clause)
@@ -707,3 +856,565 @@ fn exec_delete_rel(db: &mut GraphDatabase, rest: &str) -> Result<usize> {
 }
 
 fn parse_uuid_from(s: &str) -> Result<Uuid> { Uuid::parse_str(s.trim()).map_err(|e| anyhow!("invalid uuid: {}", e)) }
+
+/// Execute CALL procedure for graph algorithms
+/// Supported: CALL algo.pageRank(), CALL algo.betweenness(), CALL algo.shortestPath(from, to), CALL algo.allPaths(from, to, maxDepth)
+fn exec_call_procedure(db: &mut GraphDatabase, rest: &str) -> Result<(Vec<QueryResultRow>, usize, usize, bool)> {
+    let rest = rest.trim();
+    let upper = rest.to_uppercase();
+    
+    if upper.starts_with("ALGO.PAGERANK") {
+        // CALL algo.pageRank() or CALL algo.pageRank(damping, iterations)
+        let scores = pagerank(db, 0.85, 20);
+        let mut rows: Vec<QueryResultRow> = scores.iter()
+            .filter_map(|(id, score)| {
+                db.get_node(*id).map(|n| {
+                    let mut meta = n.metadata.clone();
+                    meta.insert("_score".to_string(), format!("{:.6}", score));
+                    QueryResultRow::Node { id: *id, label: n.label.clone(), metadata: meta }
+                })
+            })
+            .collect();
+        // Sort by score descending
+        rows.sort_by(|a, b| {
+            let score_a = match a { QueryResultRow::Node { metadata, .. } => metadata.get("_score").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0), _ => 0.0 };
+            let score_b = match b { QueryResultRow::Node { metadata, .. } => metadata.get("_score").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0), _ => 0.0 };
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("ALGO.BETWEENNESS") {
+        // CALL algo.betweenness()
+        let scores = betweenness_centrality(db);
+        let mut rows: Vec<QueryResultRow> = scores.iter()
+            .filter_map(|(id, score)| {
+                db.get_node(*id).map(|n| {
+                    let mut meta = n.metadata.clone();
+                    meta.insert("_score".to_string(), format!("{:.6}", score));
+                    QueryResultRow::Node { id: *id, label: n.label.clone(), metadata: meta }
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let score_a = match a { QueryResultRow::Node { metadata, .. } => metadata.get("_score").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0), _ => 0.0 };
+            let score_b = match b { QueryResultRow::Node { metadata, .. } => metadata.get("_score").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0), _ => 0.0 };
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("ALGO.SHORTESTPATH") {
+        // CALL algo.shortestPath(fromId, toId)
+        let args = extract_call_args(rest)?;
+        if args.len() < 2 {
+            return Err(anyhow!("algo.shortestPath requires 2 arguments: fromId, toId"));
+        }
+        let from_id = Uuid::parse_str(&args[0]).map_err(|e| anyhow!("invalid from uuid: {}", e))?;
+        let to_id = Uuid::parse_str(&args[1]).map_err(|e| anyhow!("invalid to uuid: {}", e))?;
+        
+        match shortest_path(db, from_id, to_id) {
+            Some(path) => {
+                let rows: Vec<QueryResultRow> = path.iter()
+                    .enumerate()
+                    .filter_map(|(i, id)| {
+                        db.get_node(*id).map(|n| {
+                            let mut meta = n.metadata.clone();
+                            meta.insert("_pathIndex".to_string(), i.to_string());
+                            QueryResultRow::Node { id: *id, label: n.label.clone(), metadata: meta }
+                        })
+                    })
+                    .collect();
+                Ok((rows, 0, 0, false))
+            }
+            None => Ok((vec![QueryResultRow::Info("No path found".to_string())], 0, 0, false))
+        }
+    } else if upper.starts_with("ALGO.ASTAR") {
+        // CALL algo.astar(fromId, toId) - requires node positions, uses Euclidean heuristic
+        // Note: This requires positions which aren't available in query context, so we fall back to BFS
+        let args = extract_call_args(rest)?;
+        if args.len() < 2 {
+            return Err(anyhow!("algo.astar requires 2 arguments: fromId, toId"));
+        }
+        let from_id = Uuid::parse_str(&args[0]).map_err(|e| anyhow!("invalid from uuid: {}", e))?;
+        let to_id = Uuid::parse_str(&args[1]).map_err(|e| anyhow!("invalid to uuid: {}", e))?;
+        
+        // Use empty positions - astar will fall back to BFS behavior
+        let positions = std::collections::HashMap::new();
+        match astar_path(db, &positions, from_id, to_id) {
+            Some(path) => {
+                let rows: Vec<QueryResultRow> = path.iter()
+                    .enumerate()
+                    .filter_map(|(i, id)| {
+                        db.get_node(*id).map(|n| {
+                            let mut meta = n.metadata.clone();
+                            meta.insert("_pathIndex".to_string(), i.to_string());
+                            QueryResultRow::Node { id: *id, label: n.label.clone(), metadata: meta }
+                        })
+                    })
+                    .collect();
+                Ok((rows, 0, 0, false))
+            }
+            None => Ok((vec![QueryResultRow::Info("No path found".to_string())], 0, 0, false))
+        }
+    } else if upper.starts_with("ALGO.ALLPATHS") {
+        // CALL algo.allPaths(fromId, toId, maxDepth)
+        let args = extract_call_args(rest)?;
+        if args.len() < 3 {
+            return Err(anyhow!("algo.allPaths requires 3 arguments: fromId, toId, maxDepth"));
+        }
+        let from_id = Uuid::parse_str(&args[0]).map_err(|e| anyhow!("invalid from uuid: {}", e))?;
+        let to_id = Uuid::parse_str(&args[1]).map_err(|e| anyhow!("invalid to uuid: {}", e))?;
+        let max_depth: usize = args[2].parse().map_err(|_| anyhow!("invalid maxDepth"))?;
+        
+        let paths = all_paths(db, from_id, to_id, max_depth);
+        let mut rows = Vec::new();
+        for (path_idx, path) in paths.iter().enumerate() {
+            let path_str = path.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(" -> ");
+            rows.push(QueryResultRow::Info(format!("Path {}: {} (length {})", path_idx + 1, path_str, path.len())));
+        }
+        if rows.is_empty() {
+            rows.push(QueryResultRow::Info("No paths found".to_string()));
+        }
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("DB.SEARCH") {
+        // CALL db.search("query text") - Full-text search using FTS5
+        let args = extract_call_args(rest)?;
+        if args.is_empty() {
+            return Err(anyhow!("db.search requires 1 argument: search query"));
+        }
+        let query = &args[0];
+        
+        // Search in-memory by label and metadata (FTS5 is in SQLite, this is a fallback)
+        let mut rows = Vec::new();
+        let query_lower = query.to_lowercase();
+        for node in db.nodes.values() {
+            let label_match = node.label.to_lowercase().contains(&query_lower);
+            let meta_match = node.metadata.values().any(|v| v.to_lowercase().contains(&query_lower));
+            if label_match || meta_match {
+                rows.push(QueryResultRow::Node {
+                    id: node.id,
+                    label: node.label.clone(),
+                    metadata: node.metadata.clone(),
+                });
+            }
+        }
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("TEMPORAL.TIMELINE") {
+        // CALL temporal.timeline() - Get timeline of all graph events
+        let timeline = get_timeline(db);
+        let rows: Vec<QueryResultRow> = timeline.iter()
+            .map(|e| QueryResultRow::Info(format!("{}: {:?} {} ({})", e.timestamp, e.event_type, e.entity_id, e.label)))
+            .collect();
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("TEMPORAL.RANGE") {
+        // CALL temporal.range() - Get timestamp range of the graph
+        match get_timestamp_range(db) {
+            Some((min, max)) => Ok((vec![QueryResultRow::Info(format!("min: {}, max: {}", min, max))], 0, 0, false)),
+            None => Ok((vec![QueryResultRow::Info("Graph is empty".to_string())], 0, 0, false)),
+        }
+    } else if upper.starts_with("TEMPORAL.NODESINRANGE") {
+        // CALL temporal.nodesInRange(fromTimestamp, toTimestamp)
+        let args = extract_call_args(rest)?;
+        if args.len() < 2 {
+            return Err(anyhow!("temporal.nodesInRange requires 2 arguments: fromTimestamp, toTimestamp"));
+        }
+        let from: i64 = args[0].parse().map_err(|_| anyhow!("invalid fromTimestamp"))?;
+        let to: i64 = args[1].parse().map_err(|_| anyhow!("invalid toTimestamp"))?;
+        let node_ids = nodes_in_range(db, from, to);
+        let rows: Vec<QueryResultRow> = node_ids.iter()
+            .filter_map(|id| db.get_node(*id).map(|n| QueryResultRow::Node {
+                id: *id,
+                label: n.label.clone(),
+                metadata: n.metadata.clone(),
+            }))
+            .collect();
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("TEMPORAL.ATTIME") {
+        // CALL temporal.atTime(timestamp) - Get graph state at a specific time
+        let args = extract_call_args(rest)?;
+        if args.is_empty() {
+            return Err(anyhow!("temporal.atTime requires 1 argument: timestamp"));
+        }
+        let timestamp: i64 = args[0].parse().map_err(|_| anyhow!("invalid timestamp"))?;
+        let (nodes, rels) = graph_at_time(db, timestamp);
+        let mut rows: Vec<QueryResultRow> = nodes.iter()
+            .map(|n| QueryResultRow::Node { id: n.id, label: n.label.clone(), metadata: n.metadata.clone() })
+            .collect();
+        for r in &rels {
+            rows.push(QueryResultRow::Relationship {
+                id: r.id,
+                from: r.from_node,
+                to: r.to_node,
+                label: r.label.clone(),
+                metadata: r.metadata.clone(),
+            });
+        }
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("DB.SCHEMA") {
+        // CALL db.schema() - Get graph schema (labels and relationship types)
+        use crate::semantic::rag::suggest_queries;
+        let suggestions = suggest_queries(db);
+        let mut rows = Vec::new();
+        
+        // List node labels
+        for (label, ids) in &db.label_index {
+            rows.push(QueryResultRow::Info(format!("Label: {} ({} nodes)", label, ids.len())));
+        }
+        
+        // List relationship types
+        let mut rel_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for rel in db.relationships.values() {
+            *rel_counts.entry(rel.label.clone()).or_insert(0) += 1;
+        }
+        for (label, count) in rel_counts {
+            rows.push(QueryResultRow::Info(format!("RelType: {} ({} relationships)", label, count)));
+        }
+        
+        // Add query suggestions
+        rows.push(QueryResultRow::Info("--- Suggested Queries ---".to_string()));
+        for suggestion in suggestions.iter().take(5) {
+            rows.push(QueryResultRow::Info(suggestion.clone()));
+        }
+        
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("SEMANTIC.EXTRACT") {
+        // CALL semantic.extract("text") - Extract entities from text (simple heuristic mode)
+        use crate::semantic::extraction::extract_entities_simple;
+        let args = extract_call_args(rest)?;
+        if args.is_empty() {
+            return Err(anyhow!("semantic.extract requires 1 argument: text"));
+        }
+        let text = &args[0];
+        let result = extract_entities_simple(text);
+        
+        let mut rows = Vec::new();
+        for entity in &result.entities {
+            rows.push(QueryResultRow::Info(format!(
+                "Entity: {} [{}] (confidence: {:.2})",
+                entity.name, entity.label, entity.confidence
+            )));
+        }
+        if rows.is_empty() {
+            rows.push(QueryResultRow::Info("No entities extracted".to_string()));
+        }
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("EMBEDDING.SIMILAR") {
+        // CALL embedding.similar("query text", k, "Label") - Find k most similar nodes by embedding
+        // Optional 3rd argument filters by node label
+        use crate::semantic::embeddings::{UnifiedEmbedder, cosine_similarity, l2_distance, NearestNeighbor};
+        use crate::persistence::settings::AppSettings;
+        use crate::persistence::persist::get_current_embedding_model;
+        
+        let args = extract_call_args(rest)?;
+        if args.is_empty() {
+            return Err(anyhow!("embedding.similar requires at least 1 argument: query text"));
+        }
+        let query_text = &args[0];
+        let k: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+        let label_filter: Option<String> = args.get(2).map(|s| s.to_string());
+        
+        // Load model from SQLite first, fall back to settings file
+        let model = get_current_embedding_model()
+            .unwrap_or_else(|| AppSettings::load().map(|s| s.embedding_model).unwrap_or_default());
+        
+        // Create embedder for the configured model
+        let mut embedder = UnifiedEmbedder::new(model)
+            .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
+        
+        // For TF-IDF/Word2Vec, we MUST fit on the corpus first so the query embedding
+        // uses the same vocabulary as the stored embeddings
+        if matches!(model, crate::persistence::settings::EmbeddingModel::TfIdf | crate::persistence::settings::EmbeddingModel::Word2Vec) {
+            let texts: Vec<String> = db.nodes.values()
+                .map(|n| {
+                    let mut parts = vec![n.label.clone()];
+                    parts.extend(n.metadata.values().cloned());
+                    parts.join(" ")
+                })
+                .collect();
+            embedder.fit(&texts);
+        }
+        
+        let query_embedding = embedder.embed(query_text);
+        
+        // Always generate fresh embeddings for comparison to ensure consistency
+        // This guarantees the query and node embeddings use the same model state
+        // Filter by label if provided
+        let mut neighbors: Vec<NearestNeighbor> = db.nodes.iter()
+            .filter(|(_, node)| {
+                if let Some(ref label) = label_filter {
+                    node.label.eq_ignore_ascii_case(label)
+                } else {
+                    true
+                }
+            })
+            .map(|(id, node)| {
+                let mut parts = vec![node.label.clone()];
+                parts.extend(node.metadata.values().cloned());
+                let text = parts.join(" ");
+                let emb = embedder.embed(&text);
+                let sim = cosine_similarity(&query_embedding, &emb);
+                let dist = l2_distance(&query_embedding, &emb);
+                NearestNeighbor { node_id: *id, similarity: sim, distance: dist }
+            })
+            .collect();
+        neighbors.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+        neighbors.truncate(k);
+        let results = neighbors;
+        
+        let rows: Vec<QueryResultRow> = results.iter()
+            .filter_map(|nn| {
+                db.get_node(nn.node_id).map(|n| {
+                    let mut meta = n.metadata.clone();
+                    meta.insert("_similarity".to_string(), format!("{:.4}", nn.similarity));
+                    meta.insert("_distance".to_string(), format!("{:.4}", nn.distance));
+                    QueryResultRow::Node { id: nn.node_id, label: n.label.clone(), metadata: meta }
+                })
+            })
+            .collect();
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("EMBEDDING.NEIGHBORS") {
+        // CALL embedding.neighbors(nodeId, k) - Find k nearest neighbors to a node
+        use crate::semantic::embeddings::{cosine_similarity, l2_distance, NearestNeighbor};
+        use crate::persistence::settings::AppSettings;
+        use crate::persistence::persist::get_current_embedding_model;
+        
+        let args = extract_call_args(rest)?;
+        if args.is_empty() {
+            return Err(anyhow!("embedding.neighbors requires at least 1 argument: nodeId"));
+        }
+        let node_id = Uuid::parse_str(&args[0]).map_err(|e| anyhow!("invalid nodeId: {}", e))?;
+        let k: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+        
+        // Load model from SQLite first, fall back to settings file
+        let model = get_current_embedding_model()
+            .unwrap_or_else(|| AppSettings::load().map(|s| s.embedding_model).unwrap_or_default());
+        let model_type = match model {
+            crate::persistence::settings::EmbeddingModel::TfIdf => "tfidf",
+            crate::persistence::settings::EmbeddingModel::Word2Vec => "word2vec",
+            crate::persistence::settings::EmbeddingModel::Onnx => "onnx",
+        };
+        
+        // Load persisted embeddings from SQLite
+        let stored_embeddings = if let Ok(storage) = get_embedding_storage() {
+            storage.load_all_model_embeddings(model_type).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        
+        let results: Vec<NearestNeighbor> = if let Some(source_emb) = stored_embeddings.get(&node_id) {
+            let mut neighbors: Vec<NearestNeighbor> = stored_embeddings.iter()
+                .filter(|(id, _)| **id != node_id)
+                .map(|(id, emb)| {
+                    let sim = cosine_similarity(source_emb, emb);
+                    let dist = l2_distance(source_emb, emb);
+                    NearestNeighbor { node_id: *id, similarity: sim, distance: dist }
+                })
+                .collect();
+            neighbors.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+            neighbors.truncate(k);
+            neighbors
+        } else {
+            Vec::new()
+        };
+        
+        let rows: Vec<QueryResultRow> = results.iter()
+            .filter_map(|nn| {
+                db.get_node(nn.node_id).map(|n| {
+                    let mut meta = n.metadata.clone();
+                    meta.insert("_similarity".to_string(), format!("{:.4}", nn.similarity));
+                    meta.insert("_distance".to_string(), format!("{:.4}", nn.distance));
+                    QueryResultRow::Node { id: nn.node_id, label: n.label.clone(), metadata: meta }
+                })
+            })
+            .collect();
+        Ok((rows, 0, 0, false))
+    } else if upper.starts_with("EMBEDDING.THRESHOLD") {
+        // CALL embedding.threshold("query text", threshold) - Find nodes above similarity threshold
+        use crate::semantic::embeddings::{UnifiedEmbedder, cosine_similarity, l2_distance, NearestNeighbor};
+        use crate::persistence::settings::AppSettings;
+        use crate::persistence::persist::get_current_embedding_model;
+        
+        let args = extract_call_args(rest)?;
+        if args.len() < 2 {
+            return Err(anyhow!("embedding.threshold requires 2 arguments: query text, threshold (0.0-1.0)"));
+        }
+        let query_text = &args[0];
+        let threshold: f32 = args[1].parse().map_err(|_| anyhow!("invalid threshold"))?;
+        
+        // Load model from SQLite first, fall back to settings file
+        let model = get_current_embedding_model()
+            .unwrap_or_else(|| AppSettings::load().map(|s| s.embedding_model).unwrap_or_default());
+        
+        // Create embedder for the configured model
+        let mut embedder = UnifiedEmbedder::new(model)
+            .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
+        
+        // For TF-IDF/Word2Vec, we MUST fit on the corpus first
+        if matches!(model, crate::persistence::settings::EmbeddingModel::TfIdf | crate::persistence::settings::EmbeddingModel::Word2Vec) {
+            let texts: Vec<String> = db.nodes.values()
+                .map(|n| {
+                    let mut parts = vec![n.label.clone()];
+                    parts.extend(n.metadata.values().cloned());
+                    parts.join(" ")
+                })
+                .collect();
+            embedder.fit(&texts);
+        }
+        
+        let query_embedding = embedder.embed(query_text);
+        
+        // Always generate fresh embeddings for comparison to ensure consistency
+        let mut neighbors: Vec<NearestNeighbor> = db.nodes.iter()
+            .filter_map(|(id, node)| {
+                let mut parts = vec![node.label.clone()];
+                parts.extend(node.metadata.values().cloned());
+                let text = parts.join(" ");
+                let emb = embedder.embed(&text);
+                let sim = cosine_similarity(&query_embedding, &emb);
+                if sim >= threshold {
+                    Some(NearestNeighbor { node_id: *id, similarity: sim, distance: l2_distance(&query_embedding, &emb) })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        neighbors.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+        let results = neighbors;
+        
+        let rows: Vec<QueryResultRow> = results.iter()
+            .filter_map(|nn| {
+                db.get_node(nn.node_id).map(|n| {
+                    let mut meta = n.metadata.clone();
+                    meta.insert("_similarity".to_string(), format!("{:.4}", nn.similarity));
+                    meta.insert("_distance".to_string(), format!("{:.4}", nn.distance));
+                    QueryResultRow::Node { id: nn.node_id, label: n.label.clone(), metadata: meta }
+                })
+            })
+            .collect();
+        Ok((rows, 0, 0, false))
+    } else {
+        Err(anyhow!("unknown procedure: {}", rest))
+    }
+}
+
+/// Extract arguments from a CALL procedure invocation like "algo.pageRank(arg1, arg2)"
+/// Properly handles quoted strings containing commas or spaces.
+fn extract_call_args(s: &str) -> Result<Vec<String>> {
+    if let Some(start) = s.find('(') {
+        if let Some(end) = s.rfind(')') {
+            let inner = s[start+1..end].trim();
+            if inner.is_empty() {
+                return Ok(Vec::new());
+            }
+            
+            // Parse arguments respecting quoted strings
+            let mut args = Vec::new();
+            let mut current = String::new();
+            let mut in_quote: Option<char> = None;
+            
+            for c in inner.chars() {
+                match c {
+                    '"' | '\'' => {
+                        if in_quote == Some(c) {
+                            // End of quoted string
+                            in_quote = None;
+                        } else if in_quote.is_none() {
+                            // Start of quoted string
+                            in_quote = Some(c);
+                        } else {
+                            // Different quote inside a quoted string
+                            current.push(c);
+                        }
+                    }
+                    ',' if in_quote.is_none() => {
+                        // Argument separator outside quotes
+                        let arg = current.trim().to_string();
+                        if !arg.is_empty() {
+                            args.push(arg);
+                        }
+                        current.clear();
+                    }
+                    _ => {
+                        current.push(c);
+                    }
+                }
+            }
+            
+            // Don't forget the last argument
+            let arg = current.trim().to_string();
+            if !arg.is_empty() {
+                args.push(arg);
+            }
+            
+            return Ok(args);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Re-embed all nodes using the specified embedding model.
+/// Only clears and rebuilds embeddings for the specified model, preserving other models' embeddings.
+pub fn reembed_with_model(db: &GraphDatabase, model: crate::persistence::settings::EmbeddingModel) -> Result<String> {
+    use crate::semantic::embeddings::UnifiedEmbedder;
+    
+    let node_count = db.nodes.len();
+    if node_count == 0 {
+        return Ok("No nodes to embed".to_string());
+    }
+
+    // Create embedder for the specified model
+    let mut embedder = UnifiedEmbedder::new(model)
+        .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
+
+    // Collect all text from nodes
+    let mut texts: Vec<String> = Vec::new();
+    let mut node_ids: Vec<NodeId> = Vec::new();
+    
+    for (id, node) in &db.nodes {
+        let mut text_parts = vec![node.label.clone()];
+        for value in node.metadata.values() {
+            text_parts.push(value.clone());
+        }
+        texts.push(text_parts.join(" "));
+        node_ids.push(*id);
+    }
+
+    // Fit the embedder (for TF-IDF models)
+    embedder.fit(&texts);
+
+    // Generate embeddings
+    let embeddings = embedder.embed_batch(&texts);
+    
+    let model_type = embedder.model_type_str();
+    
+    // Store embeddings in SQLite if available (using per-model tables)
+    if let Ok(mut storage) = get_embedding_storage() {
+        // Clear only this model's embeddings (not all embeddings)
+        let _ = storage.clear_model_embeddings(model_type);
+        
+        // Save model state (for TF-IDF) with model-specific key
+        if let Some(state) = embedder.serialize_state() {
+            let state_key = format!("{}_state", model_type);
+            let _ = storage.save_embedding_model_state(&state_key, &state);
+        }
+        
+        // Batch save embeddings for better performance
+        let embedding_pairs: Vec<(NodeId, Vec<f32>)> = node_ids.iter()
+            .zip(embeddings.iter())
+            .map(|(id, emb)| (*id, emb.clone()))
+            .collect();
+        let _ = storage.save_model_embeddings_batch(model_type, &embedding_pairs);
+    }
+
+    let model_name = match model {
+        crate::persistence::settings::EmbeddingModel::TfIdf => "TF-IDF",
+        crate::persistence::settings::EmbeddingModel::Word2Vec => "Word2Vec",
+        crate::persistence::settings::EmbeddingModel::Onnx => "ONNX (all-MiniLM-L6-v2)",
+    };
+
+    Ok(format!("Re-embedded {} nodes using {}", node_count, model_name))
+}
+
+/// Get SQLite storage for embeddings
+fn get_embedding_storage() -> Result<crate::persistence::sqlite_backend::SqliteStorage> {
+    let path = crate::persistence::persist::active_sqlite_path();
+    crate::persistence::sqlite_backend::SqliteStorage::open(&path)
+        .map_err(|e| anyhow!("Failed to open SQLite storage: {}", e))
+}
