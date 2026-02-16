@@ -25,7 +25,15 @@ set -e
 
 # Application metadata (override with environment variables or edit defaults)
 APP_NAME="${APP_NAME:-Graph-Loom}"
-APP_VERSION="${APP_VERSION:-1.9.2}"
+# Try to read version from Cargo.toml if APP_VERSION not set
+SCRIPT_DIR_TMP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT_TMP="$(dirname "$SCRIPT_DIR_TMP")"
+if [ -z "$APP_VERSION" ]; then
+    CARGO_VERSION=$(grep -m1 '^version' "$PROJECT_ROOT_TMP/Cargo.toml" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/')
+    APP_VERSION="${CARGO_VERSION:-1.9.2}"
+else
+    APP_VERSION="$APP_VERSION"
+fi
 APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.example.$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]')}"
 APP_PUBLISHER="${APP_PUBLISHER:-Your Name}"
 APP_URL="${APP_URL:-https://github.com/yourusername}"
