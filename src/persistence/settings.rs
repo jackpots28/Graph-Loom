@@ -4,6 +4,53 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::auth::AuthConfig;
+
+/// Storage backend selection for graph persistence
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StorageBackend {
+    /// RON text format (legacy, human-readable)
+    Ron,
+    /// SQLite database (ACID-compliant, scalable)
+    #[default]
+    Sqlite,
+}
+
+/// LLM provider selection for semantic features
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LlmProvider {
+    #[default]
+    None,
+    OpenAI,
+    Anthropic,
+    Ollama,
+}
+
+impl LlmProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LlmProvider::None => "None",
+            LlmProvider::OpenAI => "OpenAI",
+            LlmProvider::Anthropic => "Anthropic",
+            LlmProvider::Ollama => "Ollama",
+        }
+    }
+}
+
+/// Embedding model selection for semantic search
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EmbeddingModel {
+    /// TF-IDF based embeddings (fast, lightweight)
+    TfIdf,
+    /// Word2Vec style embeddings (learns from graph)
+    Word2Vec,
+    /// ONNX all-MiniLM-L6-v2 model (best quality)
+    #[default]
+    Onnx,
+}
+
+fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     // If None, use OS default autosave directory
@@ -14,10 +61,6 @@ pub struct AppSettings {
     // If None, server traffic logs go to OS temp dir
     #[serde(default)]
     pub api_log_override: Option<PathBuf>,
-    // Persist UI/LOD settings between runs
-    pub lod_enabled: bool,
-    pub lod_label_min_zoom: f32,
-    pub lod_hide_labels_node_threshold: usize,
     // API service configuration (actix)
     #[serde(default)]
     pub api_enabled: bool,
@@ -38,6 +81,27 @@ pub struct AppSettings {
     // Default directory for saving notes
     #[serde(default)]
     pub notes_dir_override: Option<PathBuf>,
+    // Storage backend selection (Ron or Sqlite)
+    #[serde(default)]
+    pub storage_backend: StorageBackend,
+    // LLM integration settings
+    #[serde(default)]
+    pub llm_provider: LlmProvider,
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+    #[serde(default = "default_llm_model")]
+    pub llm_model: String,
+    #[serde(default)]
+    pub llm_endpoint: Option<String>,
+    /// Authentication configuration for API access
+    #[serde(default)]
+    pub auth_config: AuthConfig,
+    /// Embedding model for semantic search
+    #[serde(default)]
+    pub embedding_model: EmbeddingModel,
+    /// Physics timeout in seconds (0 = indefinite movement)
+    #[serde(default = "AppSettings::default_physics_timeout")]
+    pub physics_timeout_secs: u64,
 }
 
 impl Default for AppSettings {
@@ -46,9 +110,6 @@ impl Default for AppSettings {
             autosave_override: None,
             export_override: None,
             api_log_override: None,
-            lod_enabled: true,
-            lod_label_min_zoom: 0.7,
-            lod_hide_labels_node_threshold: 200,
             api_enabled: false,
             api_bind_addr: Self::default_bind_addr(),
             api_port: Self::default_port(),
@@ -57,6 +118,14 @@ impl Default for AppSettings {
             grpc_port: Self::default_grpc_port(),
             background_on_close: false,
             notes_dir_override: None,
+            storage_backend: StorageBackend::default(),
+            llm_provider: LlmProvider::default(),
+            llm_api_key: None,
+            llm_model: Self::default_llm_model(),
+            llm_endpoint: None,
+            auth_config: AuthConfig::default(),
+            embedding_model: EmbeddingModel::default(),
+            physics_timeout_secs: Self::default_physics_timeout(),
         }
     }
 }
@@ -184,6 +253,9 @@ impl AppSettings {
     pub(crate) fn default_bind_addr() -> String { "127.0.0.1".to_string() }
     pub(crate) fn default_port() -> u16 { 8787 }
     pub(crate) fn default_grpc_port() -> u16 { 50051 }
+    pub(crate) fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
+    /// Default physics timeout: 0 means indefinite (nodes move until settled)
+    pub(crate) fn default_physics_timeout() -> u64 { 0 }
 
     pub fn api_endpoint(&self) -> String {
         format!("{}:{}", self.api_bind_addr, self.api_port)

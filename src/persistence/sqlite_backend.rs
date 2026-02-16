@@ -495,6 +495,25 @@ impl SqliteStorage {
         }
     }
 
+    /// Save the currently selected embedding model type
+    pub fn save_current_embedding_model(&self, model_type: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO embedding_model_state (key, value) VALUES ('current_model', ?1)",
+            params![model_type.as_bytes()],
+        )?;
+        Ok(())
+    }
+
+    /// Load the currently selected embedding model type
+    pub fn load_current_embedding_model(&self) -> rusqlite::Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT value FROM embedding_model_state WHERE key = 'current_model'")?;
+        let result: rusqlite::Result<Vec<u8>> = stmt.query_row([], |row| row.get(0));
+        match result {
+            Ok(data) => Ok(Some(String::from_utf8_lossy(&data).to_string())),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 
     // ==================== Per-Model Embedding Methods ====================
 
