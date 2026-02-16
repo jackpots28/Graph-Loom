@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use crate::graph_utils::graph::{GraphDatabase, NodeId};
 use crate::persistence::persist::{self, AppStateFile};
-use crate::persistence::settings::AppSettings;
+use crate::persistence::settings::{AppSettings, LlmProvider};
 use crate::gql::query_interface::{self, QueryResultRow};
 use crate::api::{self, ApiRequest};
 
@@ -197,6 +197,8 @@ enum SidebarMode {
 enum PrefsTab {
     App,
     Api,
+    Llm,
+    Embeddings,
 }
 
 pub struct GraphApp {
@@ -291,24 +293,11 @@ pub struct GraphApp {
     _cluster_converge_enabled: bool,
     _cluster_converge_threshold: usize,
     _cluster_converge_strength: f32,
-    gravity_enabled: bool,
-    gravity_strength: f32,
-    // Center-of-mass (COM) local gravity settings
-    com_gravity_radius: f32,         // within this radius, prefer attraction to local COM
-    com_gravity_min_neighbors: usize, // minimum nearby nodes to switch from global to local COM
-    hub_repulsion_scale: f32,
-    // Level-of-detail (LOD) rendering controls
-    lod_enabled: bool,
-    lod_label_min_zoom: f32,
-    lod_hide_labels_node_threshold: usize,
     // Maximum characters for node label display (truncation)
     node_label_max_len: usize,
     // Edge label readability controls
     _edge_labels_enabled: bool,
     _edge_labels_only_on_hover: bool,
-    edge_label_min_zoom: f32,
-    edge_label_count_threshold: usize,
-    edge_label_bg_alpha: u8,
     // Focus/hover state for dimming/highlighting
     hover_node: Option<NodeId>,
     // Transient zoom HUD (show current zoom briefly when scrolling)
@@ -421,23 +410,12 @@ impl GraphApp {
             query_suggest_index: 0,
             query_suggest_hover_index: None,
             re_cluster_pending: true,
-            _cluster_converge_enabled: false, // deprecated in favor of gravity/repulsion aids
+            _cluster_converge_enabled: false,
             _cluster_converge_threshold: 30,
             _cluster_converge_strength: 3.0,
-            gravity_enabled: false,
-            gravity_strength: 6.0,
-            com_gravity_radius: 150.0,
-            com_gravity_min_neighbors: 2,
-            hub_repulsion_scale: 1.0,
-            lod_enabled: true,
-            lod_label_min_zoom: 0.7,
-            lod_hide_labels_node_threshold: 200,
             node_label_max_len: 15,
             _edge_labels_enabled: true,
             _edge_labels_only_on_hover: false,
-            edge_label_min_zoom: 0.8,
-            edge_label_count_threshold: 500,
-            edge_label_bg_alpha: 170,
             hover_node: None,
             zoom_hud_until: None,
             app_settings: settings.clone(),
@@ -465,10 +443,6 @@ impl GraphApp {
             confirm_note_delete: false,
             note_delete_path: None,
         };
-        // Apply settings to runtime toggles
-        s.lod_enabled = s.app_settings.lod_enabled;
-        s.lod_label_min_zoom = s.app_settings.lod_label_min_zoom;
-        s.lod_hide_labels_node_threshold = s.app_settings.lod_hide_labels_node_threshold;
         // Initialize API broker and server based on settings
         let rx = api::init_broker();
         s.api_rx = Some(rx);
@@ -876,7 +850,13 @@ impl GraphApp {
 
     pub fn from_state(state: AppStateFile) -> Self {
         let (db, positions, pan, zoom) = state.to_runtime();
+
         let settings = AppSettings::load().unwrap_or_default();
+        // If embedding tables are empty, rebuild embeddings for all nodes and persist them
+        if persist::is_embeddings_empty() && !db.nodes.is_empty() {
+            // Use reembed_with_model which properly persists to SQLite
+            let _ = query_interface::reembed_with_model(&db, settings.embedding_model);
+        }
         let mut s = Self {
             db,
             node_positions: positions,
@@ -947,20 +927,9 @@ impl GraphApp {
             _cluster_converge_enabled: false,
             _cluster_converge_threshold: 30,
             _cluster_converge_strength: 3.0,
-            gravity_enabled: false,
-            gravity_strength: 6.0,
-            com_gravity_radius: 150.0,
-            com_gravity_min_neighbors: 2,
-            hub_repulsion_scale: 1.0,
-            lod_enabled: true,
-            lod_label_min_zoom: 0.7,
-            lod_hide_labels_node_threshold: 200,
             node_label_max_len: 15,
             _edge_labels_enabled: true,
             _edge_labels_only_on_hover: false,
-            edge_label_min_zoom: 0.8,
-            edge_label_count_threshold: 500,
-            edge_label_bg_alpha: 170,
             hover_node: None,
             zoom_hud_until: None,
             app_settings: settings.clone(),
@@ -988,10 +957,6 @@ impl GraphApp {
             confirm_note_delete: false,
             note_delete_path: None,
         };
-        // Apply settings to runtime toggles
-        s.lod_enabled = s.app_settings.lod_enabled;
-        s.lod_label_min_zoom = s.app_settings.lod_label_min_zoom;
-        s.lod_hide_labels_node_threshold = s.app_settings.lod_hide_labels_node_threshold;
         // Initialize API broker and server based on settings
         let rx = api::init_broker();
         s.api_rx = Some(rx);
@@ -1013,7 +978,12 @@ impl GraphApp {
     }
 
     fn save_now_with(&mut self, style: NoticeStyle) {
-        let state = AppStateFile::from_runtime(&self.db, &self.node_positions, self.pan, self.zoom);
+        let state = AppStateFile::from_runtime(
+            &self.db,
+            &self.node_positions,
+            self.pan,
+            self.zoom,
+        );
         match persist::save_active(&state) {
             Ok(path) => {
                 self.dirty = false;
@@ -1032,7 +1002,12 @@ impl GraphApp {
     fn save_now(&mut self) { self.save_now_with(NoticeStyle::Prominent); }
 
     fn save_versioned_now(&mut self) {
-        let state = AppStateFile::from_runtime(&self.db, &self.node_positions, self.pan, self.zoom);
+        let state = AppStateFile::from_runtime(
+            &self.db,
+            &self.node_positions,
+            self.pan,
+            self.zoom,
+        );
         match persist::save_versioned(&state) {
             Ok(path) => {
                 self.last_save = Instant::now();
@@ -1223,7 +1198,7 @@ impl eframe::App for GraphApp {
                 std::thread::spawn(move || {
                     for i in 1..=5 {
                         std::thread::sleep(std::time::Duration::from_millis(500));
-                        
+
                         // If the user has hidden the window again during this loop, stop immediately
                         if !crate::gui::app_state::SHOW_WINDOW.load(std::sync::atomic::Ordering::SeqCst) {
                             ctx_clone.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
@@ -1232,7 +1207,7 @@ impl eframe::App for GraphApp {
 
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx_clone.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                        
+
                         // Use Win32 API to force foreground on Windows
                         #[cfg(target_os = "windows")]
                         unsafe {
@@ -1264,7 +1239,7 @@ impl eframe::App for GraphApp {
                 // Minimized(true) is often better than Visible(false).
                 // However, the user said "The app icon on the taskbar also does not return as it should",
                 // implying it DOES leave the taskbar (which is what we want for "background mode").
-                // If we use Visible(false), it leaves the taskbar. 
+                // If we use Visible(false), it leaves the taskbar.
                 // To make it come back, we MUST use Visible(true).
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
@@ -1282,7 +1257,7 @@ impl eframe::App for GraphApp {
                         None => query_interface::execute_and_log(&mut self.db, &req.query),
                     };
                     let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
-                    
+
                     // If we mutated the DB, we might want to save eventually.
                     // But we don't need to repaint the UI.
                 }
@@ -1316,9 +1291,15 @@ impl eframe::App for GraphApp {
             );
             // Best effort respond; ignore send errors if client disconnected
             let _ = req.respond_to.send(res.map_err(|e| e.to_string()));
-            
+
             count += 1;
             if count >= 5 { break; } // Process at most 5 requests per frame
+        }
+
+        // Schedule periodic repaint to process API requests even when GUI is idle
+        // This ensures glsh/gRPC queries don't hang waiting for user interaction
+        if self.api_running {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
         // Native menu command handling removed; in-window menus cover these actions
@@ -1337,6 +1318,10 @@ impl eframe::App for GraphApp {
                         if ui.selectable_label(app_sel, "App Settings").clicked() { self.prefs_tab = PrefsTab::App; }
                         let api_sel = self.prefs_tab == PrefsTab::Api;
                         if ui.selectable_label(api_sel, "API Settings").clicked() { self.prefs_tab = PrefsTab::Api; }
+                        let llm_sel = self.prefs_tab == PrefsTab::Llm;
+                        if ui.selectable_label(llm_sel, "LLM Settings").clicked() { self.prefs_tab = PrefsTab::Llm; }
+                        let emb_sel = self.prefs_tab == PrefsTab::Embeddings;
+                        if ui.selectable_label(emb_sel, "Embeddings").clicked() { self.prefs_tab = PrefsTab::Embeddings; }
                     });
                     ui.separator();
 
@@ -1398,10 +1383,15 @@ impl eframe::App for GraphApp {
                             ui.monospace(eff_notes.display().to_string());
 
                             ui.separator();
-                            ui.heading("Rendering / LOD");
-                            ui.checkbox(&mut self.prefs_edit.lod_enabled, "Enable level-of-detail (LOD)");
-                            ui.add(egui::Slider::new(&mut self.prefs_edit.lod_label_min_zoom, 0.1..=3.0).text("Label min zoom"));
-                            ui.add(egui::Slider::new(&mut self.prefs_edit.lod_hide_labels_node_threshold, 0..=5000).text("Hide labels above N nodes"));
+                            ui.heading("Physics / Layout");
+                            ui.horizontal(|ui| {
+                                ui.label("Node movement timeout (seconds):");
+                                let mut timeout = self.prefs_edit.physics_timeout_secs as i32;
+                                if ui.add(egui::DragValue::new(&mut timeout).range(0..=300)).changed() {
+                                    self.prefs_edit.physics_timeout_secs = timeout as u64;
+                                }
+                            });
+                            ui.small("0 = indefinite (nodes move until settled). Higher values stop physics after N seconds.");
 
                             ui.separator();
                             ui.heading("Background Mode");
@@ -1458,6 +1448,156 @@ impl eframe::App for GraphApp {
                             };
                             ui.small(format!("Effective API log dir: {}", eff_api_log.display()));
                         }
+                        PrefsTab::Llm => {
+                            ui.heading("LLM Integration");
+                            ui.label("Configure LLM provider for semantic features (entity extraction, natural language queries).");
+                            ui.separator();
+
+                            ui.horizontal(|ui| {
+                                ui.label("Provider:");
+                                egui::ComboBox::from_id_salt("llm_provider")
+                                    .selected_text(self.prefs_edit.llm_provider.as_str())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.prefs_edit.llm_provider, LlmProvider::None, "None");
+                                        ui.selectable_value(&mut self.prefs_edit.llm_provider, LlmProvider::OpenAI, "OpenAI");
+                                        ui.selectable_value(&mut self.prefs_edit.llm_provider, LlmProvider::Anthropic, "Anthropic");
+                                        ui.selectable_value(&mut self.prefs_edit.llm_provider, LlmProvider::Ollama, "Ollama (Local)");
+                                    });
+                            });
+
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label("API Key:");
+                                let key_str = self.prefs_edit.llm_api_key.clone().unwrap_or_default();
+                                let mut key_edit = key_str;
+                                if ui.add(egui::TextEdit::singleline(&mut key_edit).password(true).hint_text("Enter API key")).changed() {
+                                    self.prefs_edit.llm_api_key = if key_edit.is_empty() { None } else { Some(key_edit) };
+                                }
+                            });
+                            ui.small("Required for OpenAI and Anthropic. Not needed for local Ollama.");
+
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Model:");
+                                ui.text_edit_singleline(&mut self.prefs_edit.llm_model);
+                            });
+                            ui.small("Examples: gpt-4o-mini, claude-3-haiku-20240307, llama3.2");
+
+                            ui.add_space(8.0);
+                            let endpoint_str = self.prefs_edit.llm_endpoint.clone().unwrap_or_default();
+                            let mut endpoint_edit = endpoint_str;
+                            ui.horizontal(|ui| {
+                                ui.label("Custom Endpoint:");
+                                if ui.text_edit_singleline(&mut endpoint_edit).changed() {
+                                    self.prefs_edit.llm_endpoint = if endpoint_edit.is_empty() { None } else { Some(endpoint_edit) };
+                                }
+                            });
+                            ui.small("Optional. For Ollama, default is http://localhost:11434");
+
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.heading("Usage");
+                            ui.label("Once configured, use these query commands:");
+                            ui.monospace("CALL semantic.extract(\"Your text here\")");
+                            ui.small("  → Extracts entities from text");
+                            ui.monospace("CALL db.schema()");
+                            ui.small("  → Shows graph schema with query suggestions");
+                        }
+                        PrefsTab::Embeddings => {
+                            // Query Tips Section
+                            ui.collapsing("💡 Query Tips", |ui| {
+                                ui.monospace("CALL embedding.similar(\"search text\", k)");
+                                ui.small("  → Find k most similar nodes");
+                                ui.monospace("CALL embedding.neighbors(nodeId, k)");
+                                ui.small("  → Find k nearest neighbors to a node");
+                                ui.monospace("CALL embedding.threshold(\"text\", 0.5)");
+                                ui.small("  → Find nodes above similarity threshold");
+                            });
+                            ui.add_space(8.0);
+
+                            // Model Selection
+                            ui.horizontal(|ui| {
+                                ui.label("Model:");
+                                egui::ComboBox::from_id_salt("embedding_model_select")
+                                    .selected_text(match self.prefs_edit.embedding_model {
+                                        crate::persistence::settings::EmbeddingModel::TfIdf => "TF-IDF (Fast)",
+                                        crate::persistence::settings::EmbeddingModel::Word2Vec => "Word2Vec (Semantic)",
+                                        crate::persistence::settings::EmbeddingModel::Onnx => "all-MiniLM-L6-v2 (Best)",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.prefs_edit.embedding_model,
+                                            crate::persistence::settings::EmbeddingModel::Onnx,
+                                            "ONNX (Best Quality)"
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.prefs_edit.embedding_model,
+                                            crate::persistence::settings::EmbeddingModel::TfIdf,
+                                            "TF-IDF (Fast)"
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.prefs_edit.embedding_model,
+                                            crate::persistence::settings::EmbeddingModel::Word2Vec,
+                                            "Word2Vec (Semantic)"
+                                        );
+                                    });
+                            });
+                            ui.add_space(8.0);
+
+                            // Embedding Statistics
+                            if let crate::persistence::settings::StorageBackend::Sqlite = self.app_settings.storage_backend {
+                                if let Some(storage) = persist::get_sqlite_storage() {
+                                    if let Ok(stats) = storage.get_stats() {
+                                        ui.label(format!(
+                                            "📊 TF-IDF: {} | Word2Vec: {} | ONNX: {} | Nodes: {}",
+                                            stats.tfidf_embeddings, stats.word2vec_embeddings, stats.onnx_embeddings, stats.node_count
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.add_space(8.0);
+
+                            // Actions for selected model
+                            ui.horizontal(|ui| {
+                                if ui.button("🗑 Clear").on_hover_text("Clear embeddings for selected model").clicked() {
+                                    let model_type = match self.prefs_edit.embedding_model {
+                                        crate::persistence::settings::EmbeddingModel::TfIdf => "tfidf",
+                                        crate::persistence::settings::EmbeddingModel::Word2Vec => "word2vec",
+                                        crate::persistence::settings::EmbeddingModel::Onnx => "onnx",
+                                    };
+                                    let model_name = match self.prefs_edit.embedding_model {
+                                        crate::persistence::settings::EmbeddingModel::TfIdf => "TF-IDF",
+                                        crate::persistence::settings::EmbeddingModel::Word2Vec => "Word2Vec",
+                                        crate::persistence::settings::EmbeddingModel::Onnx => "ONNX",
+                                    };
+                                    if let Some(storage) = persist::get_sqlite_storage() {
+                                        match storage.clear_model_embeddings(model_type) {
+                                            Ok(_) => self.prefs_status = Some(format!("{} embeddings cleared", model_name)),
+                                            Err(e) => self.prefs_status = Some(format!("Error: {}", e)),
+                                        }
+                                    }
+                                }
+                                if ui.button("🔄 Regenerate").on_hover_text("Regenerate embeddings for selected model").clicked() {
+                                    match query_interface::reembed_with_model(&self.db, self.prefs_edit.embedding_model) {
+                                        Ok(msg) => {
+                                            self.mark_dirty();
+                                            let _ = self.prefs_edit.save();
+                                            self.app_settings = self.prefs_edit.clone();
+                                            self.prefs_status = Some(msg);
+                                        }
+                                        Err(e) => self.prefs_status = Some(format!("Error: {}", e)),
+                                    }
+                                }
+                                if ui.button("🧹 Optimize DB").on_hover_text("Run VACUUM + ANALYZE").clicked() {
+                                    if let Some(storage) = persist::get_sqlite_storage() {
+                                        match storage.optimize() {
+                                            Ok(_) => self.prefs_status = Some("Database optimized".to_string()),
+                                            Err(e) => self.prefs_status = Some(format!("Error: {}", e)),
+                                        }
+                                    }
+                                }
+                            });
+                        }
                     }
 
                     if let Some(msg) = &self.prefs_status {
@@ -1495,19 +1635,18 @@ impl eframe::App for GraphApp {
                             // Persist
                             match self.prefs_edit.save() {
                                 Ok(()) => {
+                                    // Save embedding model to SQLite for CALL embedding.* functions
+                                    let _ = persist::save_current_embedding_model(self.prefs_edit.embedding_model);
+                                    
                                     // Determine if API server config changed
                                     let old_api = (self.app_settings.api_enabled.clone(), self.app_settings.api_bind_addr.clone(), self.app_settings.api_port, self.app_settings.api_key.clone());
                                     let old_grpc = (self.app_settings.grpc_enabled.clone(), self.app_settings.grpc_port, self.app_settings.api_bind_addr.clone(), self.app_settings.api_key.clone());
                                     // Detect export dir change to refresh default export paths in views
                                     let old_export_dir = self.app_settings.export_dir();
                                     self.app_settings = self.prefs_edit.clone();
-                                    // Apply to runtime
-                                    self.lod_enabled = self.app_settings.lod_enabled;
-                                    self.lod_label_min_zoom = self.app_settings.lod_label_min_zoom;
-                                    self.lod_hide_labels_node_threshold = self.app_settings.lod_hide_labels_node_threshold;
                                     let new_api = (self.app_settings.api_enabled.clone(), self.app_settings.api_bind_addr.clone(), self.app_settings.api_port, self.app_settings.api_key.clone());
                                     let new_grpc = (self.app_settings.grpc_enabled.clone(), self.app_settings.grpc_port, self.app_settings.api_bind_addr.clone(), self.app_settings.api_key.clone());
-                                    
+
                                     if old_api != new_api {
                                         // Restart server
                                         api::server::stop_server();
@@ -1524,6 +1663,9 @@ impl eframe::App for GraphApp {
                                     }
 
                                     self.api_running = self.app_settings.api_enabled || self.app_settings.grpc_enabled;
+
+                                    // Toast the success message
+                                    self.prefs_status = Some("Settings saved successfully".to_string());
 
                                     let new_export_dir = self.app_settings.export_dir();
                                     if old_export_dir != new_export_dir {
@@ -1556,10 +1698,6 @@ impl eframe::App for GraphApp {
                                             self.query_export_path = base.display().to_string();
                                         }
                                     }
-                                    self.last_save_info = Some("Preferences saved".into());
-                                    self.last_info_time = Some(Instant::now());
-                                    self.last_info_style = NoticeStyle::Prominent;
-                                    self.show_prefs_window = false;
                                 }
                                 Err(e) => {
                                     self.prefs_status = Some(format!("Failed to save preferences: {}", e));
@@ -1837,68 +1975,11 @@ impl eframe::App for GraphApp {
                         ui.small("Clusters by relationships, labels, and metadata. Dense clusters toward border; sparse toward center.");
 
                         ui.separator();
-                        ui.label("Layout aids for large graphs");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.gravity_enabled, "Enable gravity to center");
-                            ui.add(egui::Slider::new(&mut self.gravity_strength, 0.5..=20.0)
-                                .logarithmic(true)
-                                .clamping(egui::SliderClamping::Always)
-                                .text("gravity"));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Local COM radius");
-                            ui.add(egui::Slider::new(&mut self.com_gravity_radius, 60.0..=800.0)
-                                .logarithmic(true)
-                                .clamping(egui::SliderClamping::Always)
-                                .suffix(" px"))
-                                .on_hover_text("Within this radius, nodes are attracted to the center of mass of nearby nodes instead of the window center");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Min neighbors for COM");
-                            let mut min_n = self.com_gravity_min_neighbors as i32;
-                            if ui.add(egui::Slider::new(&mut min_n, 1..=10).clamping(egui::SliderClamping::Always)).changed() {
-                                self.com_gravity_min_neighbors = min_n as usize;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Hub repulsion scale");
-                            ui.add(egui::Slider::new(&mut self.hub_repulsion_scale, 0.0..=3.0)
-                                .clamping(egui::SliderClamping::Always)
-                                .text("hubs spread"));
-                        });
-                        ui.separator();
-                        ui.label("Level of detail (LOD)");
-                        ui.checkbox(&mut self.lod_enabled, "Enable LOD").on_hover_text("Hide most labels when zoomed out or when the graph is very large; always show for hovered/selected/query-matched nodes");
-                        ui.horizontal(|ui| {
-                            ui.label("Hide labels when nodes ≥");
-                            ui.add(egui::DragValue::new(&mut self.lod_hide_labels_node_threshold).range(50..=2000));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Min zoom for labels");
-                            ui.add(egui::Slider::new(&mut self.lod_label_min_zoom, 0.3..=1.5).clamping(egui::SliderClamping::Always));
-                        });
                         ui.horizontal(|ui| {
                             ui.label("Max label length");
                             ui.add(egui::DragValue::new(&mut self.node_label_max_len).range(5..=100));
                         });
 
-                        ui.separator();
-                        ui.label("Relationship label readability");
-                        ui.horizontal(|ui| {
-                            ui.label("Min zoom for edge labels");
-                            ui.add(egui::Slider::new(&mut self.edge_label_min_zoom, 0.3..=2.0).clamping(egui::SliderClamping::Always));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Hide when edges ≥");
-                            ui.add(egui::DragValue::new(&mut self.edge_label_count_threshold).range(100..=5000));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Label background opacity");
-                            let mut alpha_f: f32 = self.edge_label_bg_alpha as f32;
-                            if ui.add(egui::Slider::new(&mut alpha_f, 30.0..=255.0)).changed() {
-                                self.edge_label_bg_alpha = alpha_f as u8;
-                            }
-                        });
                         });
 
                     egui::CollapsingHeader::new("Create Node")
@@ -2271,9 +2352,20 @@ impl eframe::App for GraphApp {
                                 // Build suggestion universe (cached)
                                 let mut pool: Vec<String> = Vec::new();
                                 const KEYWORDS: &[&str] = &[
+                                    // OpenCypher keywords
                                     "MATCH","OPTIONAL","OPTIONAL MATCH","WHERE","RETURN","ORDER BY","SKIP","LIMIT",
                                     "CREATE","MERGE","SET","REMOVE","DELETE","DETACH DELETE",
-                                    "DISTINCT","ASC","DESC",
+                                    "DISTINCT","ASC","DESC","WITH","UNWIND","AND","OR","NOT","IN","IS NULL","IS NOT NULL","CONTAINS","STARTS WITH","ENDS WITH",
+                                    // CALL procedures - Algorithms
+                                    "CALL","CALL algo.pageRank()","CALL algo.betweenness()","CALL algo.shortestPath(","CALL algo.astar(","CALL algo.allPaths(",
+                                    // CALL procedures - Database
+                                    "CALL db.search(","CALL db.schema()",
+                                    // CALL procedures - Temporal
+                                    "CALL temporal.timeline()","CALL temporal.range()","CALL temporal.nodesInRange(","CALL temporal.atTime(",
+                                    // CALL procedures - Semantic
+                                    "CALL semantic.extract(",
+                                    // CALL procedures - Embeddings
+                                    "CALL embedding.similar(","CALL embedding.neighbors(","CALL embedding.threshold(",
                                 ];
                                 pool.extend(KEYWORDS.iter().map(|s| s.to_string()));
                                 
@@ -3309,7 +3401,7 @@ impl eframe::App for GraphApp {
                 let pos_screen = to_screen(pos_world);
 
                 let degree = node.out_rels.len() + node.in_rels.len();
-                let base_radius = 10.0 + (degree as f32).sqrt() * 2.0;
+                let base_radius = 8.0 + (degree as f32).sqrt() * 5.0;
                 let node_radius_draw = base_radius * self.zoom;
 
                 let rect = Rect::from_center_size(pos_screen, Vec2::splat(node_radius_draw * 2.0));
@@ -3405,16 +3497,9 @@ impl eframe::App for GraphApp {
                     );
                 }
 
-                // Label (no UUID) with label-based color coding and LOD rules
-                let show_label = if !self.lod_enabled { true } else {
-                    let many = self.db.nodes.len() >= self.lod_hide_labels_node_threshold;
-                    let zoom_ok = self.zoom >= self.lod_label_min_zoom;
-                    let is_hover = self.hover_node == Some(id);
-                    let is_query = self.query_selected_nodes.contains(&id);
-                    let is_sel = matches!(self.selected, Some(SelectedItem::Node(nid)) if nid == id);
-                    (!many && zoom_ok) || is_hover || is_query || is_sel
-                };
-                if show_label {
+                // Label (no UUID) with label-based color coding
+                // LOD: hide labels when zoomed out to reduce clutter
+                if self.zoom > 0.4 {
                     let text = format_short_node(&self.db, id, self.node_label_max_len);
                     let label_color = GraphApp::color_for_label(&node.label);
                     let pos_text = pos_screen + Vec2::new(0.0, -node_radius_draw - 4.0);
@@ -3609,8 +3694,20 @@ impl eframe::App for GraphApp {
 
             // Smooth convergence using a simple spring-damper integration.
             // Neo4j-style aids for large graphs: center gravity and degree-aware repulsion.
-            let active = match self.converge_start { Some(t0) => t0.elapsed() < Duration::from_secs(5), None => false };
-            if active || any_node_dragged || self.dragging.is_some() {
+            // Physics timeout: 0 = indefinite, otherwise stop after N seconds
+            let timeout_secs = self.app_settings.physics_timeout_secs;
+            let active = match self.converge_start {
+                Some(t0) => {
+                    if timeout_secs == 0 {
+                        true // Indefinite movement
+                    } else {
+                        t0.elapsed() < Duration::from_secs(timeout_secs)
+                    }
+                }
+                None => false
+            };
+            // Pause physics when hovering over a node (so user can interact), but resume if dragging
+            if (active || any_node_dragged || self.dragging.is_some()) && (self.hover_node.is_none() || self.dragging.is_some()) {
                 // Nodes connected by relationships experience a spring force toward a target length.
                 // Nearby nodes experience a soft repulsive force to maintain spacing.
                 // We integrate per-node velocities with damping for fluid motion.
@@ -3685,50 +3782,6 @@ impl eframe::App for GraphApp {
                     }
                 }
 
-                // Gravity: prefer local center-of-mass (COM) attraction when nodes cluster off-center; otherwise pull to window center.
-                if self.gravity_enabled {
-                    let center_world = from_screen(available.center());
-                    let k_g = self.gravity_strength;
-                    let r2 = self.com_gravity_radius * self.com_gravity_radius;
-                    // Iterate over a snapshot to avoid borrow conflicts
-                    let snapshot: Vec<(NodeId, Pos2)> = self.node_positions.iter().map(|(k,v)| (*k, *v)).collect();
-                    for (id, pos) in snapshot.iter() {
-                        // If we are dragging a multi-selection, and this node is part of the unit,
-                        // we lock out gravity.
-                        if !dragged_unit.is_empty() && self.dragging.is_some() && !self.multi_selected_nodes.is_empty() {
-                            if dragged_unit.contains(id) {
-                                continue;
-                            }
-                        }
-
-                        // Compute local COM of neighbors within radius (excluding self)
-                        let mut sum_x = 0.0f32;
-                        let mut sum_y = 0.0f32;
-                        let mut count = 0usize;
-                        for (oid, opos) in snapshot.iter() {
-                            if oid == id { continue; }
-                            let dx = opos.x - pos.x;
-                            let dy = opos.y - pos.y;
-                            if dx*dx + dy*dy <= r2 {
-                                sum_x += opos.x;
-                                sum_y += opos.y;
-                                count += 1;
-                            }
-                        }
-                        let target = if count >= self.com_gravity_min_neighbors {
-                            Pos2 { x: sum_x / (count as f32), y: sum_y / (count as f32) }
-                        } else {
-                            // Instead of global center, use a weak pull to keep things from flying away
-                            // but don't force a large centered grouping.
-                            center_world 
-                        };
-                        let dir = Vec2::new(target.x - pos.x, target.y - pos.y);
-                        // Weaken global gravity pull to allow more spread
-                        let strength = if target == center_world { k_g * 0.5 } else { k_g };
-                        *forces.entry(*id).or_insert(Vec2::ZERO) += dir * strength;
-                    }
-                }
-
                 // Degree-aware repulsive separation for close pairs (O(N^2) but small/med graphs are fine)
                 let mut deg: HashMap<NodeId, usize> = HashMap::new();
                 for rel in self.db.relationships.values() {
@@ -3759,15 +3812,10 @@ impl eframe::App for GraphApp {
                         if dist < min_sep {
                             let dir = Vec2::new(dx / dist, dy / dist);
                             let overlap = (min_sep - dist).max(0.0);
-                            // Scale by node degrees to spread hubs a bit more
-                            let da = *deg.get(&a).unwrap_or(&0) as f32;
-                            let db = *deg.get(&b).unwrap_or(&0) as f32;
-                            let scale_a = 1.0 + self.hub_repulsion_scale * (da + 1.0).ln();
-                            let scale_b = 1.0 + self.hub_repulsion_scale * (db + 1.0).ln();
                             let f = dir * (repulse_k * overlap);
                             // push opposite directions
-                            *forces.entry(a).or_insert(Vec2::ZERO) -= f * scale_a;
-                            *forces.entry(b).or_insert(Vec2::ZERO) += f * scale_b;
+                            *forces.entry(a).or_insert(Vec2::ZERO) -= f;
+                            *forces.entry(b).or_insert(Vec2::ZERO) += f;
                         }
                     }
                 }
@@ -3816,7 +3864,11 @@ impl eframe::App for GraphApp {
                     }
                     self.node_velocities.insert(id, v);
                 }
-                if any_move { self.mark_dirty(); }
+                if any_move {
+                    self.mark_dirty();
+                    // Request continuous repaint for smooth animation even without mouse movement
+                    ctx.request_repaint();
+                }
             } else {
                 // Timeout reached: stop convergence by zeroing velocities
                 for v in self.node_velocities.values_mut() { *v = Vec2::ZERO; }
@@ -4094,10 +4146,10 @@ impl eframe::App for GraphApp {
             None => {}
         }
 
-        // Autosave logic: only after edits (5 seconds after the last change, prominent)
+        // Autosave logic: only after edits (5 seconds after the last change, subtle)
         let now = Instant::now();
         if self.dirty && now.duration_since(self.last_change) >= Duration::from_secs(5) {
-            self.save_now_with(NoticeStyle::Prominent);
+            self.save_now_with(NoticeStyle::Subtle);
         }
 
         // Load Versions modal
