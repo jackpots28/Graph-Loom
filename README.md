@@ -158,6 +158,16 @@ Access via `CALL` procedures in the Query Console:
     -- Find all paths up to depth 5
 ```
 
+### Levenshtein Distance (Fuzzy String Matching)
+```cypher
+    CALL string.levenshtein("search text", 2)
+    -- Find nodes within edit distance 2 (default)
+    
+    CALL string.levenshtein("search text", 3, "name")
+    -- Search specific field with custom max distance
+```
+Returns `_levenshtein_distance` and `_matched_field` in metadata.
+
 ---
 
 ## Temporal Queries
@@ -194,20 +204,62 @@ Nodes and relationships include `created_at` and `updated_at` timestamps.
 
 ### Local Embeddings (No API Required)
 
-Graph-Loom includes TF-IDF based local embeddings for semantic similarity:
+Graph-Loom includes local embeddings for semantic similarity with three options:
+
+- **ONNX** (default): Best quality using all-MiniLM-L6-v2 transformer model. Downloads ~90MB on first use.
+- **TF-IDF**: Fast, lightweight term-frequency based vectors, no downloads required
+- **Word2Vec**: Learns semantic word relationships from your graph data (pure Rust implementation)
+
+Configure in **Preferences → Embeddings** to switch between models. On startup, if the node_embeddings table is empty, all nodes are automatically re-embedded using the selected model.
 
 ![Embedding Search](assets/graph_loom_internal_embedding_call_example.png)
 
+#### ONNX Examples (Default - Best Quality)
 ```cypher
-    -- Find similar nodes by text
+    -- High-quality semantic search using transformer embeddings
     CALL embedding.similar("machine learning engineer", 10)
     
-    -- Find neighbors of a specific node
+    -- Understands synonyms and related concepts
+    CALL embedding.threshold("software development", 0.7)
+```
+
+#### TF-IDF Examples
+```cypher
+    -- Find nodes with similar keywords
+    CALL embedding.similar("database engineer", 10)
+    
+    -- Good for exact term matching
+    CALL embedding.threshold("python developer", 0.3)
+```
+
+#### Word2Vec Examples
+```cypher
+    -- Find semantically related nodes (understands word relationships)
+    CALL embedding.similar("machine learning", 10)
+    -- May return nodes about "AI", "neural networks", "deep learning"
+    
+    -- Find neighbors of a node by semantic similarity
     CALL embedding.neighbors("node-uuid", 5)
     
-    -- Find nodes above similarity threshold
+    -- Discover related concepts above similarity threshold
     CALL embedding.threshold("data science", 0.5)
 ```
+
+Word2Vec learns that words appearing in similar contexts are related, enabling discovery of semantic relationships between nodes even when they don't share exact terms.
+
+#### Fast Approximate Search (HNSW)
+```cypher
+    CALL embedding.ann("search text", 10)
+    -- O(log n) approximate nearest neighbor search using HNSW index
+```
+Faster than exact search for large graphs. Results include `_search_type: hnsw_ann` in metadata.
+
+#### Re-Embedding
+```cypher
+    CALL embedding.reembed()
+    -- Clears and rebuilds all embeddings using the selected model
+```
+Use this after changing the embedding model in Preferences, or click "Re-Embed All Nodes" in **Preferences → Embeddings**.
 
 Results include `_similarity` (cosine) and `_distance` (L2) in metadata.
 
@@ -257,6 +309,26 @@ Go to **Settings → Preferences → API Settings**:
       -d '{"query": "MATCH (n) RETURN n LIMIT 10"}'
 ```
 
+### Health Check
+
+```bash
+    curl http://127.0.0.1:8787/health
+    # Returns: {"status":"healthy","components":{...},"version":"1.15.1"}
+```
+
+### Prometheus Metrics
+
+```bash
+    curl http://127.0.0.1:8787/metrics
+    # Returns Prometheus-compatible metrics:
+    # graph_loom_queries_total{status="success"} 42
+    # graph_loom_queries_total{status="error"} 3
+    # graph_loom_query_duration_seconds_sum 12.5
+    # graph_loom_api_up 1
+    # graph_loom_nodes_total 150
+    # graph_loom_relationships_total 200
+```
+
 ### WebSocket REPL
 
 Connect to `ws://127.0.0.1:8787/ws` for interactive queries.
@@ -264,6 +336,10 @@ Connect to `ws://127.0.0.1:8787/ws` for interactive queries.
 ### gRPC
 
 High-performance interface using Protocol Buffers. See `proto/graph_loom.proto` for schema.
+
+**Available RPCs:**
+- `Execute(QueryRequest) -> QueryResponse` - Standard request/response
+- `ExecuteStream(QueryRequest) -> stream QueryRow` - Streaming for large result sets
 
 ### CLI Shell (glsh)
 
@@ -297,7 +373,7 @@ Run as a pure API server without GUI:
 
 | Flag | Description |
 |------|-------------|
-| `--background`, `-b` | Run without GUI |
+| `--background`, `-b` | Run without GUI (background/headless mode) |
 | `--api-enable` | Enable HTTP/WebSocket API |
 | `--api-bind <addr>` | Bind address (default: 127.0.0.1) |
 | `--api-port <port>` | HTTP port (default: 8787) |
@@ -357,6 +433,14 @@ The query console provides IDE-style autocomplete:
 - **Location:** OS-specific app data directory
 - **File:** `state.db`
 - **Features:** ACID compliance, FTS5 full-text search, R-tree spatial indexing
+
+### Performance Optimizations
+
+- **WAL Mode:** Write-Ahead Logging for 10-100x faster writes and concurrent reads
+- **Query Plan Caching:** LRU cache (1000 plans) reduces parse overhead for repeated queries
+- **Property Indexes:** B-tree indexes on metadata for fast property lookups
+- **Incremental Embeddings:** Add/remove nodes without full index rebuild
+- **Batch Operations:** Optimized bulk imports (1000-10000 items per transaction)
 
 ### Versioned Backups
 
