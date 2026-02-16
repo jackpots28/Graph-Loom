@@ -191,13 +191,21 @@ pub enum AuthResult {
 }
 
 /// Validate an API key and return auth context
+/// 
+/// When an API key is configured (required_key is Some), it is ALWAYS required
+/// regardless of the auth_config.enabled flag. The enabled flag only controls
+/// advanced auth features like JWT validation.
 pub fn validate_api_key(provided_key: Option<&str>, required_key: Option<&str>, config: &AuthConfig) -> AuthResult {
-    if !config.enabled {
-        return AuthResult::Disabled;
-    }
-    
+    // If an API key is configured, always require it (regardless of auth_config.enabled)
     match (provided_key, required_key) {
-        (_, None) => AuthResult::Disabled, // No key required
+        (_, None) => {
+            // No API key configured - check if advanced auth is enabled
+            if !config.enabled {
+                return AuthResult::Disabled;
+            }
+            // Advanced auth enabled but no API key - allow anonymous with default role
+            AuthResult::Success(AuthContext::new("anonymous".to_string(), config.default_role))
+        }
         (None, Some(_)) => AuthResult::MissingCredentials,
         (Some(provided), Some(required)) => {
             if provided == required {
